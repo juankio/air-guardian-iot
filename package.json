@@ -1,0 +1,12 @@
+{
+  "name": "air-guardian-iot-monorepo",
+  "private": true,
+  "scripts": {
+    "dev": "bun run start.ts",
+    "dev:backend": "cd backend && bun run src/main.ts",
+    "dev:frontend": "cd frontend && bun run dev",
+    "build:backend": "cd backend && bun run build",
+    "build:frontend": "cd frontend && bun run build",
+    "test:backend": "cd backend && bun test"
+  }
+}

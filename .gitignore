@@ -1,0 +1,25 @@
+# Node & Bun
+node_modules/
+.nuxt/
+.output/
+dist/
+*.log
+bun.lock
+bun.lockb
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# SQLite Data Lake
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# PlatformIO & Embedded
+.pio/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
