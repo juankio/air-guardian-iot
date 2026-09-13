@@ -13,7 +13,7 @@ public:
             auto cfg = _bus_instance.config();
             cfg.spi_host = VSPI_HOST;      // Bus SPI del ESP32
             cfg.spi_mode = 0;              // Modo SPI 0
-            cfg.freq_write = 40000000;     // 40 MHz para render a 60 FPS
+            cfg.freq_write = 27000000;     // 27 MHz (óptimo y estable para protoboard)
             cfg.freq_read  = 16000000;
             cfg.pin_sclk = 18;             // SCK / SCL
             cfg.pin_mosi = 23;             // MOSI / SDA

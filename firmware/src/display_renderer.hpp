@@ -7,7 +7,8 @@ enum PetEmotion {
     EMOTION_PREDICTIVE_WARNING,
     EMOTION_CRITICAL,
     EMOTION_RECOVERY,
-    EMOTION_SLEEPING
+    EMOTION_SLEEPING,
+    EMOTION_DIZZY
 };
 
 enum DisplayViewMode {
@@ -31,6 +32,8 @@ class PetDisplayRenderer {
 private:
     LGFX_GC9A01 lcd;
     LGFX_Sprite canvas;
+    LovyanGFX* gfx = nullptr;
+    bool useSprite = false;
 
     // Físicas de Resorte (Spring-Damper)
     float currentEyeX = 0;
@@ -60,17 +63,44 @@ public:
     PetDisplayRenderer() : canvas(&lcd) {}
 
     void init() {
+        Serial.println("[DISPLAY] Iniciando controlador GC9A01...");
         lcd.init();
         lcd.setRotation(0);
-        lcd.setBrightness(220);
+        lcd.setBrightness(255);
 
-        // Crear Sprite de 240x240 en memoria interna de 16 bits (RGB565)
-        canvas.setColorDepth(16);
-        canvas.createSprite(240, 240);
+        // Prueba visual directa en el hardware (Verde Esmeralda Alquimia)
+        lcd.startWrite();
+        lcd.fillScreen(0x01E6); // Verde bosque profundo
+        lcd.fillCircle(120, 120, 114, 0x02AC);
+        lcd.drawCircle(120, 120, 115, 0x07E0);
+        lcd.setTextDatum(lgfx::middle_center);
+        lcd.setTextColor(0xFFFF, 0x02AC);
+        lcd.setTextSize(2);
+        lcd.drawString("DR. MASCOTA", 120, 105);
+        lcd.setTextSize(1);
+        lcd.setTextColor(0x7FFF, 0x02AC);
+        lcd.drawString("AIR GUARDIAN 60FPS", 120, 135);
+        lcd.endWrite();
+        Serial.println("[DISPLAY] Pantalla de inicio proyectada con exito.");
+
+        // Asignar Sprite en memoria interna (profundidad 8 bits = 57KB, cabe perfecto en RAM)
+        canvas.setColorDepth(8);
+        void* p = canvas.createSprite(240, 240);
+        if (p != nullptr) {
+            gfx = &canvas;
+            useSprite = true;
+            Serial.printf("[DISPLAY] Sprite 240x240 (8-bit, 57KB) asignado en %p\n", p);
+        } else {
+            // Si falta RAM contigua, dibuja directo en la pantalla por SPI DMA sin lag
+            gfx = &lcd;
+            useSprite = false;
+            Serial.println("[DISPLAY] Modo Render Directo sobre LCD (Cero consumo de RAM).");
+        }
         lastFrameMs = millis();
     }
 
     void updateAndRender(const DisplaySharedState& state) {
+        if (!gfx) gfx = &lcd;
         uint32_t now = millis();
         float dt = (now - lastFrameMs) / 1000.0f;
         if (dt > 0.1f) dt = 0.1f;
@@ -78,25 +108,22 @@ public:
 
         updatePhysics(state, dt, now);
 
-        // Limpiar Sprite
-        canvas.startWrite();
-        
+        gfx->startWrite();
+        renderBackground(state.emotion);
         if (state.viewMode == VIEW_PET_FACE) {
-            renderBackground(state.emotion);
             renderFace(state, now);
         } else {
-            renderBackground(state.emotion);
             renderCircularHUD(state);
         }
+        gfx->endWrite();
 
-        canvas.endWrite();
-        // Vuelco por hardware DMA directo a la GC9A01
-        canvas.pushSprite(0, 0);
+        if (useSprite) {
+            canvas.pushSprite(0, 0);
+        }
     }
 
 private:
     void updatePhysics(const DisplaySharedState& state, float dt, uint32_t now) {
-        // Físicas del resorte para las pupilas
         float tx = state.targetEyeX + saccadeX;
         float ty = state.targetEyeY + saccadeY;
 
@@ -109,11 +136,12 @@ private:
         currentEyeX += eyeVelX;
         currentEyeY += eyeVelY;
 
-        // Respiración senoidal
         breathAngle += dt * 2.5f;
 
-        // Temporizador de Parpadeo
-        if (now >= nextBlinkMs && !isBlinking && state.emotion != EMOTION_SLEEPING) {
+        if (state.emotion == EMOTION_DIZZY) {
+            isBlinking = false;
+            blinkProgress = 0.0f;
+        } else if (now >= nextBlinkMs && !isBlinking && state.emotion != EMOTION_SLEEPING) {
             isBlinking = true;
             blinkProgress = 0.0f;
         }
@@ -127,7 +155,6 @@ private:
             }
         }
 
-        // Micro-sacadas oculares
         if (now >= nextSaccadeMs) {
             nextSaccadeMs = now + 1500 + (esp_random() % 2500);
             if ((esp_random() % 10) > 4) {
@@ -139,7 +166,6 @@ private:
             }
         }
 
-        // Animación de Tos periódica en estado PREDICTIVE_WARNING
         if (state.emotion == EMOTION_PREDICTIVE_WARNING) {
             coughTimerMs += (uint32_t)(dt * 1000.0f);
             if (coughTimerMs > 3500) {
@@ -158,166 +184,190 @@ private:
     }
 
     void renderBackground(PetEmotion emotion) {
-        uint16_t bgColor = 0x0842; // Negro pizarra
+        uint16_t bgColor = 0x01E6; // Verde oscuro de laboratorio
 
         switch (emotion) {
             case EMOTION_OPTIMAL:
-                bgColor = canvas.color565(4, 30, 20); // Verde oscuro
+                bgColor = gfx->color565(4, 30, 20); // Esmeralda suave
                 break;
             case EMOTION_PREDICTIVE_WARNING:
-                bgColor = canvas.color565(36, 22, 2); // Ámbar oscuro
+                bgColor = gfx->color565(40, 24, 4); // Ámbar cálido
                 break;
             case EMOTION_CRITICAL:
-                bgColor = canvas.color565(45, 6, 12); // Rojo borgoña
+                bgColor = gfx->color565(48, 6, 14); // Rojo alerta
                 break;
             case EMOTION_RECOVERY:
-                bgColor = canvas.color565(4, 25, 40); // Cyan marino
+                bgColor = gfx->color565(6, 28, 42); // Cian ventilación
                 break;
             case EMOTION_SLEEPING:
-                bgColor = canvas.color565(12, 16, 24); // Azul noche
+                bgColor = gfx->color565(10, 14, 20); // Azul noche reposo
+                break;
+            case EMOTION_DIZZY:
+                bgColor = gfx->color565(26, 34, 10); // Tono oliva/verde mareado cómico
                 break;
         }
 
-        canvas.fillCircle(120, 120, 120, bgColor);
-        // Anillo perimetral sutil
-        canvas.drawCircle(120, 120, 118, canvas.color565(50, 55, 65));
+        gfx->fillCircle(120, 120, 120, bgColor);
+        gfx->drawCircle(120, 120, 118, gfx->color565(55, 65, 80));
     }
 
     void renderFace(const DisplaySharedState& state, uint32_t now) {
         float breathY = sinf(breathAngle) * 1.5f + coughOffset;
         int centerY = 120 + (int)breathY;
 
-        uint16_t mainColor = canvas.color565(16, 185, 129); // Verde
-        uint16_t pupilColor = canvas.color565(2, 44, 34);
+        uint16_t mainColor = gfx->color565(16, 215, 140); // Verde brillante
+        uint16_t pupilColor = gfx->color565(2, 40, 28);
 
         if (state.emotion == EMOTION_PREDICTIVE_WARNING) {
-            mainColor = canvas.color565(245, 158, 11); // Ámbar
-            pupilColor = canvas.color565(69, 26, 3);
+            mainColor = gfx->color565(251, 191, 36); // Ámbar oro
+            pupilColor = gfx->color565(65, 25, 2);
         } else if (state.emotion == EMOTION_CRITICAL) {
-            mainColor = canvas.color565(244, 63, 94);  // Rojo
-            pupilColor = canvas.color565(76, 5, 25);
+            mainColor = gfx->color565(244, 63, 94);  // Carmesí
+            pupilColor = gfx->color565(75, 4, 22);
         } else if (state.emotion == EMOTION_RECOVERY) {
-            mainColor = canvas.color565(56, 189, 248); // Cyan
-            pupilColor = canvas.color565(8, 47, 73);
+            mainColor = gfx->color565(56, 189, 248); // Cian agua
+            pupilColor = gfx->color565(8, 45, 70);
         } else if (state.emotion == EMOTION_SLEEPING) {
-            mainColor = canvas.color565(148, 163, 184); // Gris
+            mainColor = gfx->color565(148, 163, 184); // Gris
+        } else if (state.emotion == EMOTION_DIZZY) {
+            mainColor = gfx->color565(234, 179, 8); // Amarillo lima mareado cómico
+            pupilColor = gfx->color565(45, 55, 10);
         }
 
-        // Parpadeo vertical (Squash)
+        // Parpadeo elástico vertical
         float blinkH = 1.0f;
-        if (isBlinking) {
+        if (state.emotion == EMOTION_DIZZY) {
+            blinkH = 1.0f; // Mantener ojos abiertos desorbitados
+        } else if (isBlinking) {
             float p = sinf(blinkProgress * 3.14159f);
             blinkH = max(0.08f, 1.0f - p * 0.92f);
         }
 
-        // Dibujar Ojos (Izquierdo: 78, Derecho: 162)
-        int eyeXs[2] = { 78, 162 };
+        // 1. Ojos Grandes Expresivos (Izquierdo: x=76, Derecho: x=164)
+        int eyeXs[2] = { 76, 164 };
         for (int i = 0; i < 2; i++) {
             int ex = eyeXs[i];
-            int ey = centerY - 12;
+            int ey = centerY - 10;
 
             if (state.emotion == EMOTION_SLEEPING) {
-                // Arcos de sueño
-                canvas.drawArc(ex, ey + 4, 14, 16, 20, 160, mainColor);
+                gfx->drawArc(ex, ey + 4, 15, 18, 20, 160, mainColor);
             } else if (state.emotion == EMOTION_RECOVERY) {
-                // Medialuna feliz (^ ^)
-                canvas.drawArc(ex, ey - 2, 14, 17, 200, 340, mainColor);
+                // Ojitos felices en semicírculo (^ ^)
+                gfx->drawArc(ex, ey - 2, 16, 19, 200, 340, mainColor);
             } else if (state.emotion == EMOTION_CRITICAL) {
-                // Ojos en X (Mareo/Peligro)
-                canvas.drawLine(ex - 12, ey - 12, ex + 12, ey + 12, mainColor);
-                canvas.drawLine(ex + 12, ey - 12, ex - 12, ey + 12, mainColor);
-                canvas.drawLine(ex - 11, ey - 12, ex + 13, ey + 12, mainColor);
-                canvas.drawLine(ex + 13, ey - 12, ex - 11, ey + 12, mainColor);
+                // Ojos en X de peligro
+                gfx->drawLine(ex - 14, ey - 14, ex + 14, ey + 14, mainColor);
+                gfx->drawLine(ex + 14, ey - 14, ex - 14, ey + 14, mainColor);
+                gfx->drawLine(ex - 13, ey - 14, ex + 15, ey + 14, mainColor);
+                gfx->drawLine(ex + 15, ey - 14, ex - 13, ey + 14, mainColor);
+            } else if (state.emotion == EMOTION_DIZZY) {
+                // Ojos en espiral / giro orbital rápido y cejas arqueadas
+                gfx->fillEllipse(ex, ey, 24, 32, mainColor);
+
+                float dizzyAngle = now * 0.012f;
+                int px = ex + (int)(cosf(dizzyAngle + i * 3.14159f) * 7.0f);
+                int py = ey + (int)(sinf(dizzyAngle + i * 3.14159f) * 7.0f);
+
+                gfx->fillCircle(px, py, 10, pupilColor);
+                gfx->drawCircle(px, py, 6, 0xFFFF);
+                gfx->drawCircle(px, py, 3, mainColor);
+
+                // Cejas arqueadas cómicas
+                int browY = ey - 22;
+                gfx->drawArc(ex, browY, 13, 16, 200, 340, mainColor);
             } else {
-                // Ojo Vivo con Anti-Aliasing
-                int currentH = (int)(22 * blinkH);
-                if (currentH < 2) currentH = 2;
-                
-                canvas.fillEllipse(ex, ey, 22, currentH, mainColor);
+                // Ojos Vivos con Esclerótica y Brillos Anime
+                int currentH = (int)(32.0f * blinkH);
+                if (currentH < 4) currentH = 4;
+                gfx->fillEllipse(ex, ey, 24, currentH, mainColor);
 
                 if (blinkH > 0.4f) {
-                    // Pupila Inercial
-                    int px = ex + constrain((int)currentEyeX, -8, 8);
-                    int py = ey + constrain((int)currentEyeY, -7, 7);
-                    canvas.fillCircle(px, py, 10, pupilColor);
+                    // Pupila reactiva al sensor MPU
+                    int px = ex + (int)currentEyeX;
+                    int py = ey + (int)(currentEyeY * blinkH);
+                    gfx->fillCircle(px, py, 11, pupilColor);
 
-                    // Reflejos Especulares (Brillos)
-                    canvas.fillCircle(px - 4, py - 4, 4, 0xFFFF);
-                    canvas.fillCircle(px + 3, py + 3, 2, 0xFFFF);
+                    // Destellos de luz en los ojos (Catchlights)
+                    gfx->fillCircle(px - 5, py - 5, 4, 0xFFFF);
+                    gfx->fillCircle(px + 4, py + 4, 2, 0xFFFF);
                 }
 
-                // Ceja en alerta predictiva
+                // Cejas
                 if (state.emotion == EMOTION_PREDICTIVE_WARNING) {
-                    int dir = (i == 0) ? 3 : -3;
-                    canvas.drawLine(ex - 14, ey - 24 + dir, ex + 14, ey - 24 - dir, mainColor);
-                    canvas.drawLine(ex - 14, ey - 23 + dir, ex + 14, ey - 23 - dir, mainColor);
+                    int dir = (i == 0) ? 5 : -5;
+                    gfx->drawLine(ex - 16, ey - 26 + dir, ex + 16, ey - 26 - dir, mainColor);
+                    gfx->drawLine(ex - 16, ey - 25 + dir, ex + 16, ey - 25 - dir, mainColor);
                 }
             }
         }
 
-        // Dibujar Boca
-        int mouthY = centerY + 18;
+        // 2. Boca Expresiva
+        int mouthY = centerY + 30;
         if (state.emotion == EMOTION_OPTIMAL) {
-            canvas.drawArc(120, mouthY - 4, 10, 13, 20, 160, mainColor);
+            // Sonrisa amplia
+            gfx->drawArc(120, mouthY - 4, 10, 14, 20, 160, mainColor);
         } else if (state.emotion == EMOTION_PREDICTIVE_WARNING) {
-            canvas.drawLine(110, mouthY, 120, mouthY - 3, mainColor);
-            canvas.drawLine(120, mouthY - 3, 130, mouthY + 2, mainColor);
+            // Boca ondulada de preocupación
+            gfx->drawLine(110, mouthY, 120, mouthY - 3, mainColor);
+            gfx->drawLine(120, mouthY - 3, 130, mouthY + 2, mainColor);
         } else if (state.emotion == EMOTION_CRITICAL) {
-            canvas.fillEllipse(120, mouthY + 4, 7, 5, mainColor);
+            // Boca abierta de asombro/gas
+            gfx->fillEllipse(120, mouthY + 4, 8, 6, mainColor);
         } else if (state.emotion == EMOTION_RECOVERY) {
-            canvas.drawArc(120, mouthY - 8, 14, 17, 20, 160, mainColor);
-        } else if (state.emotion == EMOTION_SLEEPING) {
-            canvas.fillCircle(120, mouthY + 2, 3, mainColor);
-            // ZZZ animados
-            float zP = (now % 2000) / 2000.0f;
-            canvas.setTextColor(canvas.color565(140, 150, 170));
-            canvas.drawString("Z", 155 + (int)(zP * 15), 85 - (int)(zP * 25));
+            gfx->drawArc(120, mouthY - 6, 12, 16, 20, 160, mainColor);
+        } else if (state.emotion == EMOTION_DIZZY) {
+            // Boca mareada ondulada / zig-zag cómico
+            gfx->drawLine(108, mouthY + 1, 114, mouthY - 4, mainColor);
+            gfx->drawLine(114, mouthY - 4, 120, mouthY + 4, mainColor);
+            gfx->drawLine(120, mouthY + 4, 126, mouthY - 4, mainColor);
+            gfx->drawLine(126, mouthY - 4, 132, mouthY + 1, mainColor);
+
+            gfx->drawLine(108, mouthY + 2, 114, mouthY - 3, mainColor);
+            gfx->drawLine(114, mouthY - 3, 120, mouthY + 5, mainColor);
+            gfx->drawLine(120, mouthY + 5, 126, mouthY - 3, mainColor);
+            gfx->drawLine(126, mouthY - 3, 132, mouthY + 2, mainColor);
+        } else {
+            gfx->fillCircle(120, mouthY + 2, 3, mainColor);
         }
 
-        // Mejillas sonrosadas en estado óptimo o recuperación
-        if (state.emotion == EMOTION_OPTIMAL || state.emotion == EMOTION_RECOVERY) {
-            uint16_t blush = (state.emotion == EMOTION_OPTIMAL) ? canvas.color565(16, 120, 80) : canvas.color565(30, 110, 160);
-            canvas.fillEllipse(62, centerY + 8, 8, 4, blush);
-            canvas.fillEllipse(178, centerY + 8, 8, 4, blush);
+        // 3. Rubor en las mejillas
+        if (state.emotion == EMOTION_DIZZY) {
+            // Mejillas amarillas/verdes mareadas
+            uint16_t dizzyBlush = gfx->color565(195, 215, 35);
+            gfx->fillEllipse(60, centerY + 10, 10, 6, dizzyBlush);
+            gfx->fillEllipse(180, centerY + 10, 10, 6, dizzyBlush);
+        } else if (state.emotion != EMOTION_SLEEPING && state.emotion != EMOTION_CRITICAL) {
+            uint16_t blush = (state.emotion == EMOTION_OPTIMAL) ? gfx->color565(16, 120, 80) : gfx->color565(30, 110, 160);
+            gfx->fillEllipse(60, centerY + 10, 9, 5, blush);
+            gfx->fillEllipse(180, centerY + 10, 9, 5, blush);
         }
     }
 
     void renderCircularHUD(const DisplaySharedState& state) {
-        // Tacómetro Circular
         float startAngle = 135.0f;
         float totalAngle = 270.0f;
-        float pct = constrain((state.ppm - 350.0f) / 1650.0f, 0.0f, 1.0f);
+        float pct = constrain((state.ppm - 380.0f) / (2000.0f - 380.0f), 0.0f, 1.0f);
 
-        // Pista de fondo
-        canvas.drawArc(120, 120, 92, 102, startAngle, startAngle + totalAngle, canvas.color565(30, 40, 55));
+        gfx->drawArc(120, 120, 92, 102, startAngle, startAngle + totalAngle, gfx->color565(30, 40, 55));
 
-        // Color del arco según gas
-        uint16_t trackColor = canvas.color565(16, 185, 129);
-        if (state.ppm > 800) trackColor = canvas.color565(245, 158, 11);
-        if (state.ppm > 1400) trackColor = canvas.color565(244, 63, 94);
+        uint16_t trackColor = gfx->color565(16, 215, 140);
+        if (state.ppm > 800) trackColor = gfx->color565(251, 191, 36);
+        if (state.ppm > 1400) trackColor = gfx->color565(244, 63, 94);
 
-        canvas.drawArc(120, 120, 92, 102, startAngle, startAngle + (totalAngle * pct), trackColor);
+        gfx->drawArc(120, 120, 92, 102, startAngle, startAngle + (totalAngle * pct), trackColor);
 
-        // Lectura Digital Central
-        canvas.setTextDatum(MC_DATUM);
-        canvas.setTextColor(0xFFFF);
-        canvas.setTextSize(2);
-        canvas.drawNumber((int)state.ppm, 120, 115);
+        gfx->setTextDatum(textdatum_t::middle_center);
+        gfx->setTextColor(0xFFFF);
+        gfx->setTextSize(2);
+        gfx->drawNumber((int)state.ppm, 120, 115);
 
-        canvas.setTextSize(1);
-        canvas.setTextColor(trackColor);
-        canvas.drawString("PPM CO2eq", 120, 140);
+        gfx->setTextSize(1);
+        gfx->setTextColor(trackColor);
+        gfx->drawString("PPM CO2eq", 120, 140);
 
-        // DHT11 Datos
-        canvas.setTextColor(canvas.color565(160, 175, 195));
         char envStr[32];
-        snprintf(envStr, sizeof(envStr), "%.1f C  |  %.0f%% HR", state.temperature, state.humidity);
-        canvas.drawString(envStr, 120, 175);
-
-        // Estado Predictivo Superior
-        if (state.emotion == EMOTION_OPTIMAL) canvas.drawString("AIRE OPTIMO", 120, 65);
-        else if (state.emotion == EMOTION_PREDICTIVE_WARNING) canvas.drawString("ALERTA ALZA", 120, 65);
-        else if (state.emotion == EMOTION_CRITICAL) canvas.drawString("PELIGRO GAS", 120, 65);
-        else if (state.emotion == EMOTION_RECOVERY) canvas.drawString("VENTILANDO", 120, 65);
+        snprintf(envStr, sizeof(envStr), "%.1f C | %d%% HR", state.temperature, (int)state.humidity);
+        gfx->setTextColor(gfx->color565(160, 175, 195));
+        gfx->drawString(envStr, 120, 175);
     }
 };

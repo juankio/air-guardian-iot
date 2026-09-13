@@ -161,6 +161,35 @@ Para garantizar consistencia, capacidad de auditoría forense, rendimiento en se
 * **Propósito:** Capa de servicio de alta velocidad para visualización agregada y análisis espacial.
 * **Estructura:** Vista analítica que consolida métricas por campaña geográfica (`total_samples`, `avg_ppm`, `max_ppm`, `min_ppm`, `avg_co_ppm`, `avg_temp`, `avg_humidity`).
 
+### 3.2 Ingesta Batch Atómica y Buffer Resiliente LittleFS (`POST /api/telemetry/batch`)
+
+Para entornos de campo con conectividad intermitente, el ESP32 implementa un búfer circular en memoria flash SPIFFS/LittleFS (`offline_buffer.hpp`), encolando las lecturas en `/offline_queue.jsonl` hasta un tope defensivo de 300 KB (~3500 muestras).
+
+Al recuperar conectividad WiFi, el nodo descarga el archivo en lotes de 15 muestras mediante `POST /api/telemetry/batch`.
+
+```
+[ Nodo ESP32 Desconectado ]
+       │ (Escribe en LittleFS: /offline_queue.jsonl)
+       ▼
+[ Reconexión WiFi ] ──► HTTP POST /api/telemetry/batch (Lotes de 15 muestras)
+                               │
+                               ▼
+            ┌──────────────────────────────────────┐
+            │ NestJS TelemetryController.batch()   │
+            └──────────────────┬───────────────────┘
+                               │
+            ┌──────────────────▼───────────────────┐
+            │ Transacción Atómica db.transaction() │
+            │ • Inserción Bronze inmutable         │
+            │   (preserva timestamps del hardware) │
+            │ • Cálculo Silver de derivadas        │
+            │ • Actualización analítica Gold       │
+            └──────────────────────────────────────┘
+```
+
+* **Preservación Histórica:** La transacción procesa los registros manteniendo el `timestamp` original del reloj de tiempo real del microcontrolador, impidiendo que una ráfaga masiva sobreescriba los intervalos físicos reales ni genere pendientes espurias.
+* **Cero Corrupción de WAL:** La transacción agrupada ejecuta cientos de inserciones en un único *fsync* de SQLite, reduciendo la contención de disco a $< 1.5\text{ ms}$ por lote.
+
 ---
 
 ## 4. Modelo Matemático del Motor Predictivo
@@ -190,6 +219,51 @@ $$P(t + 15) = \text{clamp}\left( \text{ppm}(t) + (\Delta_{1\text{m}} \cdot 15 \c
 | **WARNING_PREDICTIVE** | $\Delta_{1\text{m}} > 35\text{ ppm/min} \lor P(t+15) > 850 \lor \text{PPM} > 800$ | Apertura de ventanas / Ventilación activa preventiva |
 | **RECOVERY** | $\Delta_{1\text{m}} < -30\text{ ppm/min} \land \text{PPM} < 700$ | Purga de aire en progreso favorable |
 | **OPTIMAL** | Todas las condiciones dentro de parámetros seguros | Calidad del aire óptima |
+
+### 4.4 Módulo Académico-Universitario de EDO y Métodos Numéricos
+
+Para sustentar la modelación física en cátedras de ingeniería, el sistema articula formalmente la cinética de dispersión gaseosa mediante ecuaciones diferenciales y cálculo numérico.
+
+#### A. Formulación de la EDO de Balance de Masa en Recinto Cerrado
+En un recinto sensorizado de volumen constante $V\;[\text{m}^3]$ con tasa de generación $G\;[\text{PPM}\cdot\text{m}^3/\text{min}]$ y caudal de ventilación $Q\;[\text{m}^3/\text{min}]$:
+
+$$V \frac{dC}{dt} = G - Q \cdot C(t)$$
+
+Definiendo la tasa de recambio de aire $k = \frac{Q}{V}\;[\text{min}^{-1}]$ y la concentración asintótica de equilibrio $C_\infty = \frac{G}{Q}\;[\text{PPM}]$:
+
+$$\frac{dC}{dt} + k C(t) = k C_\infty$$
+
+Aplicando el factor integrante $\mu(t) = e^{\int k dt} = e^{kt}$ e integrando con condición inicial $C(0) = C_0$, se obtiene la **solución analítica continua exacta**:
+
+$$C(t) = C_\infty + (C_0 - C_\infty) e^{-kt}$$
+
+* Constante de tiempo del recinto: $\tau = \frac{1}{k}$.
+* Tiempo para alcanzar el 95% del equilibrio: $t_{95\%} \approx 3\tau = \frac{3}{k}$.
+
+#### B. Solvers Numéricos Discretos: Euler vs. Runge-Kutta 4to Orden (RK4)
+Dado el problema de valor inicial $\frac{dC}{dt} = f(C) = k(C_\infty - C)$ y un paso de integración $h = \Delta t$:
+
+1. **Método de Euler Progresivo:**
+   $$C_{n+1} = C_n + h \cdot k(C_\infty - C_n)$$
+   Error de truncamiento local $O(h^2)$, error global acumulado $O(h)$.
+
+2. **Método de Runge-Kutta 4to Orden (RK4):**
+   $$k_1 = f(C_n), \quad k_2 = f\left(C_n + \frac{h}{2}k_1\right), \quad k_3 = f\left(C_n + \frac{h}{2}k_2\right), \quad k_4 = f(C_n + h k_3)$$
+   $$C_{n+1} = C_n + \frac{h}{6}(k_1 + 2k_2 + 2k_3 + k_4)$$
+   Error de truncamiento local $O(h^5)$, error global acumulado $O(h^4)$. Evalúa cuatro pendientes intermedias basadas en la cuadratura de Simpson.
+
+#### C. Estabilidad Asintótica de Dahlquist & Criterio de Lipschitz ($h < 2/k$)
+Para la ecuación diferencial homogénea lineal $\frac{dC}{dt} = -k C$ con $\lambda = -k < 0$, la constante de Lipschitz es $L = k$.
+El factor de amplificación de Euler es:
+
+$$\sigma(h) = 1 - hk$$
+
+Para garantizar que el error numérico no crezca exponencialmente ($|\sigma(h)| < 1$):
+
+$$-1 < 1 - hk < 1 \iff 0 < hk < 2 \implies h < \frac{2}{k}$$
+
+* **Paso crítico:** $h_{\text{crítico}} = \frac{2}{k}$.
+* Si $h \ge \frac{2}{k}$, el método de Euler exhibe inestabilidad numérica, divergiendo en oscilaciones espurias no físicas. RK4 mantiene la estabilidad sobre una región significativamente más amplia del plano complejo.
 
 ---
 
@@ -362,6 +436,19 @@ Para conectar la telemetría del sensor físico con el operador humano sin caer 
 2. **Resonancia Háptica y Visual de Laboratorio:** Uso de texturas de metal cepillado (`slate-800/900`), placas grabadas con pernos de esquina, tiras LED de iluminación de trabajo que se encienden al desplegar cada gaveta (`cyan-400`), y física de menisco de fluidos reactivos en las probetas SVG.
 3. **Composición GPU Acelerada a 60 FPS:** Las animaciones 3D y ópticas se ejecutan en capas dedicadas de composición (`[perspective: 1200px]`, `transform`, `requestAnimationFrame`), eliminando la degradación de rendimiento incluso con 10,000 muestras en memoria.
 
+### 6.2 Cartografía Táctica Leaflet (`LocationsMapBoard.vue`) & Conmutador de Modo Dual
+
+#### A. Sustitución del Radar por Cartografía Táctica de Precisión
+El radar militar analógico fue erradicado por carecer de contexto espacial real sobre coordenadas geodésicas. En su lugar, el componente `LocationsMapBoard.vue` implementa:
+- **Leaflet + CartoDB Dark Matter:** Mapa nocturno de alto contraste montado en un marco estriado de cobre con remaches mecánicos.
+- **Marcadores Semafóricos con Glow:** Pines vectoriales circulares con colores según niveles de PPM (Verde <650, Ámbar <1000, Rojo $\ge$ 1000). El pin seleccionado emite un halo de pulso (`animate-ping`).
+- **Bitácora "Lugares Donde Estuvimos":** Bandeja interactiva de expedición con centrado suave (`flyTo`) al hacer clic sobre cualquier estación de muestreo y visualización en tiempo real de coordenadas y conteo de muestras.
+
+#### B. Conmutador Galvánico de Modo Dual: Local vs En Vivo 1-a-1
+Para independizar la experiencia de laboratorio de la presencia del microcontrolador físico:
+- **🧪 Modo Local (Datos Quemados & Generador Estocástico):** Ejecuta dinámicas estocásticas con inercia continua en el cliente o activa el simulador del backend. Permite realizar exposiciones, defensas universitarias y pruebas de diseño con cero dependencia de red o hardware.
+- **📡 Modo En Vivo (ESP32 1-a-1):** Enlace directo con el microcontrolador. Supervisa la antigüedad de paquetes (`lastPacketAgeSec`). Si transcurren $>8\text{ s}$ sin telemetría física, pasa a estado `OFFLINE` y conmuta la mascota digital a estado `SLEEPING` (Zzz), previniendo falsas lecturas estáticas.
+
 ---
 
 ## 7. Architecture Decision Records (ADRs)
@@ -419,6 +506,31 @@ Para conectar la telemetría del sensor físico con el operador humano sin caer 
   * *Positivas:* Reducción drástica de la carga cognitiva mediante divulgación progresiva (*Progressive Disclosure* en gavetas colapsables); alta densidad informativa sin saturación visual; identidad visual distintiva y memorable alineada con el propósito científico del proyecto.
   * *Mitigación de Rendimiento y Accesibilidad:* Todas las animaciones 3D se restringen estrictamente a propiedades aceleradas por hardware GPU (`transform: scale/rotate`, `opacity`) con `perspective: 1200px`, garantizando 60 FPS estables sin reflows ni repaints de layout. Se integran atributos de accesibilidad (`aria-expanded`, `role="region"`, `aria-label`, foco por teclado) para asegurar compatibilidad WCAG 2.1 AA.
 
+### ADR-008: Buffer Offline en LittleFS e Ingesta Atómica por Lotes (`POST /api/telemetry/batch`)
+* **Contexto:** En campañas de campo o tránsito entre edificios universitarios, el enlace WiFi del ESP32 sufre caídas periódicas. Transmitir muestras exclusivamente por HTTP/WS síncrono causaba pérdida irreversible de telemetría ambiental.
+* **Decisión:** Implementar en el firmware (`offline_buffer.hpp`) una cola en memoria flash con LittleFS (`/offline_queue.jsonl`) limitada a una cuota defensiva de 300 KB (~3500 muestras). Al recuperar enlace WiFi, el nodo ejecuta un vaciado (*flush*) secuencial en lotes de 15 muestras vía `POST /api/telemetry/batch` (con fallback a MQTT). En el backend NestJS, procesar cada lote bajo una única transacción `db.transaction()` en SQLite WAL, preservando los timestamps originales del hardware en Capa Bronze y recalculando deltas en Capa Silver.
+* **Consecuencias:**
+  * *Positivas:* Cero pérdida de datos ante desconexiones de red prolongadas; I/O agrupado en disco sin contención; preservación estricta de la cronología real de las series temporales.
+  * *Mitigación:* Rotación automática del archivo si supera los 300 KB para evitar desgaste y fragmentación de la memoria flash del ESP32.
+
+### ADR-009: Cartografía Táctica Leaflet y Sustitución de Radar Estático por `LocationsMapBoard.vue`
+* **Contexto:** El componente de radar 360° analógico heredado operaba como un elemento decorativo sin interactividad geoespacial real, imposibilitando auditar puntos de muestreo en el campus ni visualizar dispersión geográfica.
+* **Decisión:** Reemplazar el radar por `LocationsMapBoard.vue` en el banco inferior de la consola de laboratorio, integrando Leaflet con la capa de teselas *CartoDB Dark Matter*, marcadores de calidad de aire con codificación semafórica dinámica (Verde <650, Ámbar <1000, Rojo $\ge$ 1000), halo pulsante `animate-ping` en la sesión activa, transiciones de cámara `flyTo` y la bitácora interactiva "Lugares Donde Estuvimos".
+* **Consecuencias:**
+  * *Positivas:* Geolocalización táctica real de expediciones; interacción fluida a 60 FPS; armonía estética con la temática *vintage alchemy*.
+
+### ADR-010: Arquitectura de Modo Dual Desacoplado (Local Determinista vs. En Vivo 1-a-1)
+* **Contexto:** Las exposiciones en aulas y auditorios universitarios sufren con frecuencia de restricciones de red (aislamiento de clientes WiFi, puertos WebSockets bloqueados) o ausencia de suministro eléctrico para alimentar los calefactores de los sensores analógicos.
+* **Decisión:** Implementar un selector de Modo Dual accesible desde el conmutador de cabecera y la palanca física `FrankensteinSwitch.vue`. En "Modo Local", la interfaz se alimenta de un generador estocástico determinista con inercia física real (sin depender del hardware ni de la red). En "Modo En Vivo (1-a-1)", se conecta al stream del ESP32 con monitor de latido (`lastPacketAgeSec`); si no se reciben paquetes durante más de 8 segundos, el sistema pasa a `OFFLINE` y la mascota digital entra en reposo emocional `SLEEPING` (Zzz).
+* **Consecuencias:**
+  * *Positivas:* Demostraciones 100% resilientes y confiables en cualquier escenario académico; alerta visual inmediata ante pérdida física del nodo sensor.
+
+### ADR-011: Módulo Académico de Balance de Masa EDO y Solvers Numéricos con Análisis de Estabilidad Lipschitz
+* **Contexto:** La sustentación universitaria en las asignaturas de Ecuaciones Diferenciales Ordinarias, Análisis Numérico e IoT requería justificar rigurosamente la física de dispersión gaseosa en recintos cerrados y validar los métodos de integración en tiempo discreto.
+* **Decisión:** Formular la cinética de contaminantes como una EDO lineal de primer orden ($V \frac{dC}{dt} = G - QC$), obtener la solución analítica exacta mediante factor integrante ($C(t) = C_\infty + (C_0 - C_\infty)e^{-kt}$), e implementar en frontend y backend solvers numéricos comparativos: Euler progresivo ($O(h)$) y Runge-Kutta de 4to Orden ($O(h^4)$). Integrar la verificación en tiempo real de la condición de estabilidad de Dahlquist / Lipschitz ($h < 2/k$), graficación en osciloscopio CRT y tabla de errores con exportación a CSV y LaTeX.
+* **Consecuencias:**
+  * *Positivas:* Sustentación matemática impecable respaldada por código ejecutable; visualización didáctica de la divergencia numérica cuando $h \ge h_{\text{crítico}}$; exportación de datos lista para informes académicos.
+
 ---
 
 ## 8. Auditoría de Seguridad, Accesibilidad & Resiliencia (CSO & Spatial A11y Report)
@@ -429,6 +541,10 @@ Para conectar la telemetría del sensor físico con el operador humano sin caer 
 | **Fuga de Memoria WebSocket** | **P1** (Alto) | ✅ Resuelto | Implementación de `TelemetryGateway` con monitor de vida (`isAlive`), evento `error` registrado y temporizador de limpieza cíclico (`startHeartbeat`). |
 | **División por Cero en Algoritmos Estadísticos** | **P1** (Alto) | ✅ Resuelto | En Pearson: Denominador $\sqrt{\text{Var}(X)\text{Var}(Y)} = 0 \implies r = 0.0$. En $R^2$: $SS_{\text{tot}} \le 10^{-4} \implies R^2 = 1.0$. En MAPE: Denominador $\max(1, \|y_{\text{true}}\|)$. |
 | **Desbordamiento Numérico e Inestabilidad IEEE 754** | **P1** (Alto) | ✅ Resuelto | Clamping estricto de correlación $r \in [-1.0, +1.0]$, $R^2 \in [0.0, 0.9999]$, y derivadas acotadas a $[-500, +500]\text{ ppm/min}$. |
+| **Inestabilidad Numérica en Solver Euler ($h \ge 2/k$)** | **P1** (Alto) | ✅ Mitigado | Monitor de estabilidad en tiempo real en `useNumericalAcademic.ts`: calcula $h_{\text{crítico}} = 2/k$, emite alerta visual de divergencia y previene desbordamiento en el renderizado CRT. |
+| **Saturación / Desgaste de Flash en ESP32** | **P1** (Alto) | ✅ Mitigado | Límite defensivo de 300 KB en LittleFS (`offline_buffer.hpp`) con rotación automática del archivo `/offline_queue.jsonl` ante desconexiones prolongadas. |
+| **Contención de I/O en Ingesta Batch Masiva** | **P2** (Medio) | ✅ Resuelto | Transacción agrupada `db.transaction()` en SQLite WAL que consolida cientos de registros en un único ciclo de escritura en disco. |
+| **Fuga de Instancias Leaflet Map en Nuxt** | **P2** (Medio) | ✅ Resuelto | `LocationsMapBoard.vue` destruye explícitamente el mapa (`leafletMap.remove()`) en el hook `onUnmounted` y limpia capas con `markersGroup.clearLayers()`. |
 | **Inyección CSV y Ruptura de Formato (RFC 4180)** | **P2** (Medio) | ✅ Resuelto | Escape completo de comillas dobles (`" -> ""`), delimitador de salto de línea canónico CRLF (`\r\n`), y serialización de campos no nulos. |
 | **Accesibilidad Espacial (ARIA & Keyboard Nav)** | **P2** (Medio) | ✅ Auditado | Atributos `aria-expanded`, `aria-controls` y navegación por teclado en gavetas telescópicas y botones de control del chasis. |
 | **Rendimiento 3D & Frame Budget (60 FPS)** | **P2** (Medio) | ✅ Optimizado | Canvas 240x240 renderizado vía `requestAnimationFrame`, transformaciones CSS 3D limitadas a capas de composición GPU sin layout thrashing. |
