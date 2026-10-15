@@ -25,6 +25,8 @@ private:
     float currentCoPpm = 0.0f;
     float currentTemp = 24.0f;
     float currentHumidity = 50.0f;
+    float currentVoltage135 = 0.1f;
+    float currentVoltage7 = 0.1f;
 
     // Derivada de PPM para predicción local
     float lastPpm = 400.0f;
@@ -36,8 +38,11 @@ private:
     uint32_t bootTimeMs = 0;
 
     // Físicas MPU
-    int16_t ax, ay, az;
-    int16_t gx, gy, gz;
+    int16_t ax = 0, ay = 0, az = 0;
+    int16_t gx = 0, gy = 0, gz = 0;
+    float normAx = 0.0f, normAy = 0.0f, normAz = 1.0f;
+    float pitchDeg = 0.0f, rollDeg = 0.0f;
+    bool shakingState = false;
 
 public:
     SensorManager() : dht(PIN_DHT, DHT_TYPE), bootTimeMs(0) {}
@@ -160,15 +165,25 @@ public:
             targetEyeX = 0;
             targetEyeY = 0;
             shake = false;
+            normAx = 0.0f;
+            normAy = 0.0f;
+            normAz = 1.0f;
+            pitchDeg = 0.0f;
+            rollDeg = 0.0f;
+            shakingState = false;
             return;
         }
 
         mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
 
         // Normalizar aceleración a rango G con escala +/-4G (8192 LSB/G)
-        float normAx = (float)ax / 8192.0f;
-        float normAy = (float)ay / 8192.0f;
-        float normAz = (float)az / 8192.0f;
+        normAx = (float)ax / 8192.0f;
+        normAy = (float)ay / 8192.0f;
+        normAz = (float)az / 8192.0f;
+
+        // Calcular inclinación Pitch y Roll en grados
+        pitchDeg = atan2f(-normAx, sqrtf(normAy * normAy + normAz * normAz)) * 57.2957795f;
+        rollDeg  = atan2f(normAy, sqrtf(normAx * normAx + normAz * normAz)) * 57.2957795f;
 
         // Asignar inclinación de ojos (físicas de gravedad)
         targetEyeX = constrain(normAy * 12.0f, -10.0f, 10.0f);
@@ -179,6 +194,7 @@ public:
         float totalAccel = sqrtf(normAx * normAx + normAy * normAy + normAz * normAz);
         float dynamicAccel = fabsf(totalAccel - 1.0f);
         shake = (dynamicAccel > 0.65f || abs(gx) > 8000 || abs(gy) > 8000 || abs(gz) > 8000);
+        shakingState = shake;
     }
 
     void updateGasAndEnv() {
@@ -215,9 +231,11 @@ public:
         // Protección contra voltajes saturados/flotantes (evitar overflow y división por cero)
         float rawV135 = (emaMq135 / 4095.0f) * 3.3f;
         float voltage135 = constrain(rawV135, 0.05f, 3.15f);
+        currentVoltage135 = voltage135;
 
         float rawV7 = (emaMq7 / 4095.0f) * 3.3f;
         float voltage7 = constrain(rawV7, 0.02f, 3.15f);
+        currentVoltage7 = voltage7;
 
         // Curva robusta y acotada MQ-135 (PPM CO2eq)
         float computedPpm = 400.0f + powf(10.0f, (voltage135 * 1.25f)) * envFactor;
@@ -253,6 +271,14 @@ public:
     float getDeltaPPM() const { return deltaPpm; }
     float getRawAdc135() const { return emaMq135; }
     float getRawAdc7() const { return emaMq7; }
+    float getVoltage135() const { return currentVoltage135; }
+    float getVoltage7() const { return currentVoltage7; }
+    float getPitch() const { return pitchDeg; }
+    float getRoll() const { return rollDeg; }
+    float getNormAx() const { return normAx; }
+    float getNormAy() const { return normAy; }
+    float getNormAz() const { return normAz; }
+    bool isShaking() const { return shakingState; }
     bool isMpuConnected() const { return hasMpu; }
     void getRawMPU(int16_t& _ax, int16_t& _ay, int16_t& _az, int16_t& _gx, int16_t& _gy, int16_t& _gz) {
         _ax = ax; _ay = ay; _az = az;

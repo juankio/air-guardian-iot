@@ -25,6 +25,11 @@ struct DisplaySharedState {
     float humidity;
     float targetEyeX;
     float targetEyeY;
+    float pitch;
+    float roll;
+    float ax;
+    float ay;
+    float az;
     bool shakeDetected;
 };
 

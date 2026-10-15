@@ -4,6 +4,8 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 
+static constexpr const char* DEFAULT_SERVER = "https://servidor-taller.tailf19567.ts.net:10000";
+
 /**
  * @brief Gestor de aprovisionamiento WiFi y Servidor mediante Serial y NVS (Non-Volatile Storage).
  * Diseñado para operar en Core 0 de forma 100% no-bloqueante, protegiendo los 60 FPS del Core 1.
@@ -25,6 +27,12 @@ public:
         const char* viewMode;
         float eyeX;
         float eyeY;
+        float pitch;
+        float roll;
+        float ax;
+        float ay;
+        float az;
+        bool isShaking;
     };
 
 private:
@@ -59,7 +67,7 @@ public:
      */
     void init(const char* defaultSsid = "TU_RED_WIFI", 
               const char* defaultPass = "TU_PASSWORD", 
-              const char* defaultServer = "192.168.1.100") {
+              const char* defaultServer = DEFAULT_SERVER) {
         WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
             static uint32_t lastDiscLog = 0;
             if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
@@ -83,6 +91,10 @@ public:
         ssid = prefs.getString("ssid", defaultSsid);
         password = prefs.getString("pass", defaultPass);
         server = prefs.getString("server", defaultServer);
+        if (server.length() == 0 || server == "192.168.137.1" || server == "192.168.1.100") {
+            server = defaultServer;
+            prefs.putString("server", server);
+        }
         prefs.end();
 
         Serial.println("[PROVISIONER] [OK] Credenciales cargadas desde NVS ('air-config'):");
@@ -95,8 +107,55 @@ public:
     const String& getPassword() const { return password; }
     const String& getServer() const { return server; }
 
+    String getMqttHost() const {
+        String s = server;
+        s.trim();
+        if (s.startsWith("https://")) {
+            s = s.substring(8);
+        } else if (s.startsWith("http://")) {
+            s = s.substring(7);
+        }
+        int slashIdx = s.indexOf('/');
+        if (slashIdx >= 0) {
+            s = s.substring(0, slashIdx);
+        }
+        int colonIdx = s.indexOf(':');
+        if (colonIdx >= 0) {
+            s = s.substring(0, colonIdx);
+        }
+        return s;
+    }
+
+    String buildBaseUrl(uint16_t lanPort = 3002) const {
+        String s = server;
+        s.trim();
+        if (s.length() == 0) {
+            s = DEFAULT_SERVER;
+        }
+        while (s.endsWith("/")) {
+            s.remove(s.length() - 1);
+        }
+        if (s.startsWith("http://") || s.startsWith("https://")) {
+            return s;
+        }
+        if (s.indexOf(".ts.net") >= 0) {
+            if (s.indexOf(':') >= 0) {
+                return String("https://") + s;
+            }
+            return String("https://") + s + ":10000";
+        }
+        if (s.indexOf(':') >= 0) {
+            return String("http://") + s;
+        }
+        return String("http://") + s + ":" + String(lanPort);
+    }
+
+    String getIngestUrl() const {
+        return buildBaseUrl(3002) + "/api/telemetry/ingest";
+    }
+
     String getBackendUrl(uint16_t port = 3002) const {
-        return String("http://") + server + ":" + String(port) + "/api/telemetry/batch";
+        return buildBaseUrl(port) + "/api/telemetry/batch";
     }
 
     /**
@@ -272,8 +331,7 @@ private:
         pendingSsid = newSsid;
     }
 
-    void handleGetStatusCommand(const TelemetryContext& ctx) {
-        JsonDocument report;
+    void buildStatusJson(JsonDocument& report, const TelemetryContext& ctx) {
         report["cmd"] = "STATUS";
 
         // Estado de red
@@ -285,6 +343,7 @@ private:
         net["rssi"] = connected ? WiFi.RSSI() : 0;
         net["mac"] = WiFi.macAddress();
         net["server"] = server;
+        net["ingest_url"] = getIngestUrl();
         net["mqtt_connected"] = ctx.mqttConnected;
 
         // Estado de hardware
@@ -309,11 +368,21 @@ private:
         sens["view_mode"] = ctx.viewMode ? ctx.viewMode : "FACE";
         sens["eye_x"] = round(ctx.eyeX * 10) / 10.0;
         sens["eye_y"] = round(ctx.eyeY * 10) / 10.0;
+        sens["pitch"] = round(ctx.pitch * 10) / 10.0;
+        sens["roll"] = round(ctx.roll * 10) / 10.0;
+        sens["ax"] = round(ctx.ax * 100) / 100.0;
+        sens["ay"] = round(ctx.ay * 100) / 100.0;
+        sens["az"] = round(ctx.az * 100) / 100.0;
+        sens["is_shaking"] = ctx.isShaking;
 
         // Almacenamiento LittleFS / Buffer Offline
         JsonObject storage = report["storage"].to<JsonObject>();
         storage["offline_pending"] = ctx.offlinePending;
+    }
 
+    void handleGetStatusCommand(const TelemetryContext& ctx) {
+        JsonDocument report;
+        buildStatusJson(report, ctx);
         serializeJson(report, Serial);
         Serial.println();
     }

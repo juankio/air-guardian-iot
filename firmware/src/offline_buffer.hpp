@@ -4,6 +4,7 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 
 /**
@@ -54,6 +55,10 @@ public:
         }
         isMounted = true;
         updatePendingCount();
+        if (pendingCount > 50) {
+            LittleFS.remove(filePath);
+            pendingCount = 0;
+        }
         Serial.printf("[OFFLINE-FS] LittleFS montado con éxito. Muestras pendientes en cola: %u\n", (unsigned int)pendingCount);
         return true;
     }
@@ -124,9 +129,8 @@ public:
             return false;
         }
 
-        HTTPClient http;
         bool allFlushedSuccessfully = true;
-        const size_t BATCH_SIZE = 15;
+        const size_t BATCH_SIZE = 10;
 
         JsonDocument batchDoc;
         JsonArray samplesArray = batchDoc["samples"].to<JsonArray>();
@@ -141,6 +145,9 @@ public:
             JsonDocument itemDoc;
             DeserializationError err = deserializeJson(itemDoc, line);
             if (!err) {
+                if (itemDoc["timestamp"].as<uint32_t>() == 0) {
+                    itemDoc["timestamp"] = 1;
+                }
                 samplesArray.add(itemDoc);
                 currentBatchCount++;
             }
@@ -153,11 +160,21 @@ public:
 
                 // 1. Intentar HTTP POST primero (óptimo para lotes grandes)
                 if (backendUrl && strlen(backendUrl) > 0) {
-                    http.begin(backendUrl);
+                    String urlStr(backendUrl);
+                    int httpCode = -1;
+                    WiFiClientSecure secureClient;
+                    WiFiClient plainClient;
+                    HTTPClient http;
+                    if (urlStr.startsWith("https://")) {
+                        secureClient.setInsecure();
+                        http.begin(secureClient, urlStr);
+                    } else {
+                        http.begin(plainClient, urlStr);
+                    }
                     http.addHeader("Content-Type", "application/json");
-                    http.setTimeout(1500); // Evitar congelar Core 0 si el backend no responde
-                    int httpCode = http.POST(payload);
-                    if (httpCode == 200 || httpCode == 201) {
+                    http.setTimeout(3000); // Evitar congelar Core 0 si el backend no responde
+                    httpCode = http.POST(payload);
+                    if (httpCode == 200 || httpCode == 201 || httpCode == 400) {
                         batchSuccess = true;
                         totalSent += currentBatchCount;
                         Serial.printf("[OFFLINE-SYNC] Lote de %u enviado por HTTP (Código %d). Progreso: %u\n",

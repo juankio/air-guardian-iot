@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
@@ -14,7 +15,7 @@
 // Configuración por defecto de Red WiFi y Backend (valores placeholder para repo público)
 const char* DEFAULT_WIFI_SSID     = "TU_RED_WIFI";
 const char* DEFAULT_WIFI_PASSWORD = "TU_PASSWORD";
-const char* DEFAULT_MQTT_SERVER   = "192.168.1.100";
+const char* DEFAULT_MQTT_SERVER   = DEFAULT_SERVER;
 const int   MQTT_PORT             = 1883;
 const char* DEVICE_ID             = "air-guardian-01";
 
@@ -104,8 +105,13 @@ void setup() {
     sharedState.co_ppm = 0.0f;
     sharedState.temperature = 24.0f;
     sharedState.humidity = 55.0f;
-    sharedState.targetEyeX = 0;
-    sharedState.targetEyeY = 0;
+    sharedState.targetEyeX = 0.0f;
+    sharedState.targetEyeY = 0.0f;
+    sharedState.pitch = 0.0f;
+    sharedState.roll = 0.0f;
+    sharedState.ax = 0.0f;
+    sharedState.ay = 0.0f;
+    sharedState.az = 1.0f;
     sharedState.shakeDetected = false;
 
     // Inicializar Hardware
@@ -139,7 +145,7 @@ void setup() {
     xTaskCreatePinnedToCore(
         TaskTelemetryCore0,
         "TaskTelemetryCore0",
-        8192,
+        16384,
         NULL,
         1, // Prioridad normal
         NULL,
@@ -184,6 +190,16 @@ void TaskRenderCore1(void* parameter) {
         portENTER_CRITICAL(&stateMutex);
         sharedState.targetEyeX = eyeX;
         sharedState.targetEyeY = eyeY;
+        sharedState.pitch = sensors.getPitch();
+        sharedState.roll = sensors.getRoll();
+        sharedState.ax = sensors.getNormAx();
+        sharedState.ay = sensors.getNormAy();
+        sharedState.az = sensors.getNormAz();
+        if (shake) {
+            sharedState.shakeDetected = true;
+        } else if (now >= dizzyUntilMs) {
+            sharedState.shakeDetected = false;
+        }
         localState = sharedState;
         portEXIT_CRITICAL(&stateMutex);
 
@@ -207,7 +223,8 @@ void TaskRenderCore1(void* parameter) {
 // --------------------------------------------------------------------------
 void TaskTelemetryCore0(void* parameter) {
     wifiProvisioner.startConnection();
-    mqttClient.setServer(wifiProvisioner.getServer().c_str(), MQTT_PORT);
+    String mqttHost = wifiProvisioner.getMqttHost();
+    mqttClient.setServer(mqttHost.c_str(), MQTT_PORT);
     mqttClient.setCallback(mqttCallback);
 
     uint32_t lastPublishMs = 0;
@@ -223,10 +240,14 @@ void TaskTelemetryCore0(void* parameter) {
         float currentHum = sensors.getHumidity();
         float deltaPpm = sensors.getDeltaPPM();
         int rawAdc = (int)sensors.getRawAdc135();
+        int rawAdc7 = (int)sensors.getRawAdc7();
+        float voltage135 = sensors.getVoltage135();
+        float voltage7 = sensors.getVoltage7();
 
         uint32_t now = millis();
 
         // 2. Actualizar variables compartidas para el render en Core 1
+        DisplaySharedState snapState;
         portENTER_CRITICAL(&stateMutex);
         sharedState.ppm = currentPpm;
         sharedState.co_ppm = currentCo;
@@ -259,7 +280,10 @@ void TaskTelemetryCore0(void* parameter) {
                 }
             }
         }
+        snapState = sharedState;
         portEXIT_CRITICAL(&stateMutex);
+
+        bool isShakingNow = snapState.shakeDetected || sensors.isShaking() || (dizzyUntilMs > now) || (snapState.emotion == EMOTION_DIZZY);
 
         // 3. Procesar comandos Serial CLI y Aprovisionamiento WiFi (No bloqueante)
         WiFiProvisioner::TelemetryContext provCtx;
@@ -271,12 +295,18 @@ void TaskTelemetryCore0(void* parameter) {
         provCtx.mqttConnected = mqttClient.connected();
         provCtx.hasMpu = sensors.isMpuConnected();
         provCtx.raw135 = rawAdc;
-        provCtx.raw7 = (int)sensors.getRawAdc7();
+        provCtx.raw7 = rawAdc7;
         provCtx.deltaPpm = deltaPpm;
-        provCtx.emotion = emotionToString(sharedState.emotion);
-        provCtx.viewMode = (sharedState.viewMode == VIEW_PET_FACE) ? "FACE" : "HUD";
-        provCtx.eyeX = sharedState.targetEyeX;
-        provCtx.eyeY = sharedState.targetEyeY;
+        provCtx.emotion = emotionToString(snapState.emotion);
+        provCtx.viewMode = (snapState.viewMode == VIEW_PET_FACE) ? "FACE" : "HUD";
+        provCtx.eyeX = snapState.targetEyeX;
+        provCtx.eyeY = snapState.targetEyeY;
+        provCtx.pitch = snapState.pitch;
+        provCtx.roll = snapState.roll;
+        provCtx.ax = snapState.ax;
+        provCtx.ay = snapState.ay;
+        provCtx.az = snapState.az;
+        provCtx.isShaking = isShakingNow;
 
         wifiProvisioner.processSerial(provCtx);
         wifiProvisioner.updateConnectionStatus();
@@ -286,7 +316,8 @@ void TaskTelemetryCore0(void* parameter) {
             if (mqttClient.connected()) {
                 mqttClient.disconnect();
             }
-            mqttClient.setServer(wifiProvisioner.getServer().c_str(), MQTT_PORT);
+            mqttHost = wifiProvisioner.getMqttHost();
+            mqttClient.setServer(mqttHost.c_str(), MQTT_PORT);
         }
 
         bool isConnected = (WiFi.status() == WL_CONNECTED);
@@ -298,66 +329,98 @@ void TaskTelemetryCore0(void* parameter) {
                               WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
             }
 
-            // Quitar intento bloqueante de MQTT: reintento periódico con timeout ultracorto
+            // Quitar intento bloqueante de MQTT cuando se usa HTTPS / Tailscale Funnel (solo HTTP/HTTPS en puerto 10000)
             static uint32_t lastMqttAttemptMs = 0;
-            if (!mqttClient.connected()) {
-                if (now - lastMqttAttemptMs >= 20000) {
-                    lastMqttAttemptMs = now;
-                    espClient.setTimeout(150);
-                    if (mqttClient.connect(DEVICE_ID)) {
-                        Serial.println("[MQTT] Conectado exitosamente.");
-                        mqttClient.subscribe("airguardian/commands/#");
-                        mqttClient.subscribe("airguardian/predictions/#");
+            String currentSrv = wifiProvisioner.getServer();
+            bool isHttpsOrFunnel = currentSrv.startsWith("https://") || (currentSrv.indexOf(".ts.net") >= 0);
+            if (!isHttpsOrFunnel) {
+                if (!mqttClient.connected()) {
+                    if (now - lastMqttAttemptMs >= 20000) {
+                        lastMqttAttemptMs = now;
+                        espClient.setTimeout(1);
+                        if (mqttClient.connect(DEVICE_ID)) {
+                            Serial.println("[MQTT] Conectado exitosamente.");
+                            mqttClient.subscribe("airguardian/commands/#");
+                            mqttClient.subscribe("airguardian/predictions/#");
+                        }
                     }
+                } else {
+                    mqttClient.loop();
                 }
-            } else {
-                mqttClient.loop();
             }
 
             // Si veníamos de estar desconectados o hay datos pendientes en LittleFS, vaciar hacia el servidor
-            if (wasOffline || offlineBuffer.hasPendingData()) {
+            static uint32_t lastOfflineFlushAttemptMs = 0;
+            if (wasOffline || (offlineBuffer.hasPendingData() && (now - lastOfflineFlushAttemptMs >= 15000))) {
+                lastOfflineFlushAttemptMs = now;
                 Serial.println("[AIR GUARDIAN] Conexión detectada. Vaciando datos offline acumulados...");
                 offlineBuffer.flushToBackend(wifiProvisioner.getBackendUrl().c_str(), &mqttClient);
                 wasOffline = false;
             }
 
-            // 5. Publicar Telemetría al Data Lake cada 2 segundos vía HTTP REST
-            if (now - lastPublishMs >= 2000) {
+            // 5. Publicar Telemetría al Data Lake cada 1 segundo vía HTTP/HTTPS REST
+            if (now - lastPublishMs >= 1000) {
                 lastPublishMs = now;
 
                 portENTER_CRITICAL(&stateMutex);
-                PetEmotion currentEmotion = sharedState.emotion;
-                DisplayViewMode currentViewMode = sharedState.viewMode;
+                snapState = sharedState;
                 portEXIT_CRITICAL(&stateMutex);
+
+                PetEmotion currentEmotion = snapState.emotion;
+                DisplayViewMode currentViewMode = snapState.viewMode;
+                bool currentShaking = snapState.shakeDetected || sensors.isShaking() || (dizzyUntilMs > now) || (currentEmotion == EMOTION_DIZZY);
+                const char* emotionStr = emotionToString(currentEmotion);
+                const char* viewModeStr = (currentViewMode == VIEW_PET_FACE) ? "FACE" : "HUD";
+                size_t pendingCount = offlineBuffer.getPendingCount();
 
                 JsonDocument doc;
                 doc["device_id"] = DEVICE_ID;
-                doc["timestamp"] = now;
+                doc["timestamp"] = now > 0 ? now : 1;
                 doc["ppm"] = round(currentPpm * 10) / 10.0;
                 doc["co_ppm"] = round(currentCo * 10) / 10.0;
+                doc["raw_adc"] = constrain(rawAdc, 0, 4095);
+                doc["voltage"] = round(voltage135 * 100) / 100.0;
+                doc["mq7_raw"] = rawAdc7;
+                doc["raw_adc7"] = rawAdc7;
+                doc["mq7_voltage"] = round(voltage7 * 100) / 100.0;
                 doc["temperature"] = round(currentTemp * 10) / 10.0;
                 doc["humidity"] = round(currentHum * 10) / 10.0;
                 doc["delta_ppm"] = round(deltaPpm * 10) / 10.0;
-                doc["raw_adc"] = rawAdc;
-                doc["raw_adc7"] = (int)sensors.getRawAdc7();
+                doc["Status"] = emotionStr;
+                doc["emotion"] = emotionStr;
+                doc["view_mode"] = viewModeStr;
                 doc["mpu_connected"] = sensors.isMpuConnected();
-                doc["eye_x"] = round(sharedState.targetEyeX * 10) / 10.0;
-                doc["eye_y"] = round(sharedState.targetEyeY * 10) / 10.0;
+                doc["eye_x"] = round(snapState.targetEyeX * 10) / 10.0;
+                doc["eye_y"] = round(snapState.targetEyeY * 10) / 10.0;
+                doc["pitch"] = round(snapState.pitch * 10) / 10.0;
+                doc["roll"] = round(snapState.roll * 10) / 10.0;
+                doc["ax"] = round(snapState.ax * 100) / 100.0;
+                doc["ay"] = round(snapState.ay * 100) / 100.0;
+                doc["az"] = round(snapState.az * 100) / 100.0;
+                doc["is_shaking"] = currentShaking;
                 doc["free_heap"] = ESP.getFreeHeap();
+                doc["min_free_heap"] = ESP.getMinFreeHeap();
                 doc["uptime_s"] = now / 1000;
-                doc["offline_pending"] = offlineBuffer.getPendingCount();
-                doc["emotion"] = emotionToString(currentEmotion);
-                doc["view_mode"] = (currentViewMode == VIEW_PET_FACE) ? "FACE" : "HUD";
+                doc["offline_queue"] = pendingCount;
+                doc["offline_pending"] = pendingCount;
 
                 String jsonPayload;
                 serializeJson(doc, jsonPayload);
 
-                // Ingesta directa HTTP a la API de NestJS
-                String ingestUrl = "http://" + wifiProvisioner.getServer() + ":3002/api/telemetry/ingest";
+                // Ingesta directa HTTP/HTTPS a la API de NestJS
+                String ingestUrl = wifiProvisioner.getIngestUrl();
+                WiFiClientSecure secureClient;
+                WiFiClient plainClient;
                 HTTPClient http;
-                http.begin(ingestUrl);
+
+                if (ingestUrl.startsWith("https://")) {
+                    secureClient.setInsecure();
+                    http.begin(secureClient, ingestUrl);
+                } else {
+                    http.begin(plainClient, ingestUrl);
+                }
                 http.addHeader("Content-Type", "application/json");
-                http.setTimeout(1200);
+                http.setTimeout(3000);
                 int code = http.POST(jsonPayload);
                 if (code == 200 || code == 201) {
                     Serial.printf("[HTTP-LIVE] Muestra publicada a %s (Code %d)\n", ingestUrl.c_str(), code);
