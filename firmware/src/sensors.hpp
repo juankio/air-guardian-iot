@@ -42,8 +42,9 @@ private:
     int16_t gx = 0, gy = 0, gz = 0;
     float smoothAx = 0.0f, smoothAy = 0.0f, smoothAz = 8192.0f;
     bool smoothInitialized = false;
-    float offsetAx = 0.0f;
-    float offsetAy = 0.0f;
+    float offsetAx = 0.23f;
+    float offsetAy = 0.13f;
+    float uprightOffsetAx = -0.04f;
     bool calibrated = false;
     float normAx = 0.0f, normAy = 0.0f, normAz = 1.0f;
     float pitchDeg = 0.0f, rollDeg = 0.0f;
@@ -194,12 +195,14 @@ public:
             offsetAx = avgAx;
             offsetAy = avgAy;
             calibrated = true;
-            Serial.printf("[MPU-6050] Auto-Tare OK: offsetAx=%.3fG, offsetAy=%.3fG (avgAz=%.3fG)\n", offsetAx, offsetAy, avgAz);
-        } else {
-            offsetAx = 0.23f;
-            offsetAy = 0.13f;
+            Serial.printf("[MPU-6050] Auto-Tare Flat OK: offsetAx=%.3fG, offsetAy=%.3fG (avgAz=%.3fG)\n", offsetAx, offsetAy, avgAz);
+        } else if (fabsf(avgAx) < 0.35f && avgAy > 0.60f) {
+            uprightOffsetAx = avgAx;
             calibrated = true;
-            Serial.printf("[MPU-6050] Auto-Tare Fallback: offsetAx=%.3fG, offsetAy=%.3fG\n", offsetAx, offsetAy);
+            Serial.printf("[MPU-6050] Auto-Tare Upright OK: uprightOffsetAx=%.3fG (avgAy=%.3fG)\n", uprightOffsetAx, avgAy);
+        } else {
+            calibrated = true;
+            Serial.printf("[MPU-6050] Auto-Tare Fallback: offsetAx=%.3fG, uprightOffsetAx=%.3fG\n", offsetAx, uprightOffsetAx);
         }
     }
 
@@ -242,8 +245,9 @@ public:
         normAy = smoothAy / 8192.0f;
         normAz = smoothAz / 8192.0f;
 
-        float calAx = normAx - offsetAx;
-        float calAy = normAy - offsetAy;
+        float tableWeight = constrain((normAz - 0.60f) / 0.30f, 0.0f, 1.0f);
+        float calAx = normAx - ((uprightOffsetAx * (1.0f - tableWeight)) + (offsetAx * tableWeight));
+        float calAy = normAy - (offsetAy * tableWeight);
 
         if (fabsf(calAx) < 0.04f) calAx = 0.0f;
         if (fabsf(calAy) < 0.04f) calAy = 0.0f;
@@ -253,16 +257,23 @@ public:
             rollDeg = 0.0f;
             pitchDeg = 0.0f;
         } else {
-            float upY = -calAx + (normAz * 0.34f);
-            rollDeg = atan2f(calAy, upY) * 180.0f / PI;
+            // En el chasis físico:
+            // - Recto en la mano (orejas arriba): calAy ≈ +0.92G, calAx ≈ 0 -> upY > 0 -> rollDeg = 0°
+            // - Plano en la mesa (boca arriba): calAx ≈ 0, calAy ≈ 0, normAz ≈ +0.98G -> upY > 0 -> rollDeg = 0°
+            // - De lado horizontal (oreja a oreja): calAx ≈ ∓0.92G, calAy ≈ 0 -> rollDeg = ±90°
+            // - De cabeza (orejas abajo): calAy ≈ -0.92G, calAx ≈ 0 -> upY < 0 -> rollDeg = ±180°
+            float upY = calAy + (normAz * 0.35f);
+            rollDeg = atan2f(-calAx, upY) * 180.0f / PI;
 
-            float rawPitch = atan2f(calAx, fmaxf(0.15f, normAz)) * 180.0f / PI * 0.45f;
-            float pitchFade = constrain(1.0f - (fabsf(rollDeg) - 85.0f) / 50.0f, 0.0f, 1.0f);
-            pitchDeg = constrain(rawPitch * pitchFade, -60.0f, 60.0f);
+            float rawPitch = 0.0f;
+            if (normAz < -0.15f) {
+                rawPitch = atan2f(-normAz - 0.15f, fmaxf(0.2f, planarMag)) * 180.0f / PI * 0.55f;
+            }
+            pitchDeg = constrain(rawPitch, -35.0f, 35.0f);
         }
 
-        if (fabsf(rollDeg) < 2.2f) rollDeg = 0.0f;
-        if (fabsf(pitchDeg) < 2.2f) pitchDeg = 0.0f;
+        if (fabsf(rollDeg) < 2.5f) rollDeg = 0.0f;
+        if (fabsf(pitchDeg) < 2.5f) pitchDeg = 0.0f;
 
         targetEyeX = constrain(rollDeg / 9.0f, -10.0f, 10.0f);
         targetEyeY = constrain(pitchDeg / 9.0f, -10.0f, 10.0f);
