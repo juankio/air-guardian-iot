@@ -3,78 +3,34 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+#include "network/serial_cli_handler.hpp"
 
 static constexpr const char* DEFAULT_SERVER = "https://servidor-taller.tailf19567.ts.net:10000";
 
-/**
- * @brief Gestor de aprovisionamiento WiFi y Servidor mediante Serial y NVS (Non-Volatile Storage).
- * Diseñado para operar en Core 0 de forma 100% no-bloqueante, protegiendo los 60 FPS del Core 1.
- */
 class WiFiProvisioner {
 public:
-    struct TelemetryContext {
-        float ppm;
-        float co_ppm;
-        float temperature;
-        float humidity;
-        size_t offlinePending;
-        bool mqttConnected;
-        bool hasMpu;
-        int raw135;
-        int raw7;
-        float deltaPpm;
-        const char* emotion;
-        const char* viewMode;
-        float eyeX;
-        float eyeY;
-        float pitch;
-        float roll;
-        float ax;
-        float ay;
-        float az;
-        bool isShaking;
-        float shakeEnergy;
-        float babyRockScore;
-    };
+    using TelemetryContext = TelemetryCliContext;
 
 private:
     Preferences prefs;
     const char* PREFS_NAMESPACE = "air-config";
-
-    String ssid;
-    String password;
-    String server;
-
-    // Buffer de recepción Serial no bloqueante
+    String ssid, password, server, pendingSsid, pendingEmotionCmd;
     static const size_t SERIAL_BUF_SIZE = 512;
     char serialBuffer[SERIAL_BUF_SIZE];
     size_t serialBufIndex = 0;
-
-    // Estado de reconexión asíncrona
     bool isReconnecting = false;
     uint32_t reconnectStartMs = 0;
-    const uint32_t RECONNECT_TIMEOUT_MS = 15000; // 15 segundos max para intentar handshake WiFi
-    String pendingSsid;
-    bool newConfigSaved = false;
-    bool pendingCalibrateMpu = false;
-    String pendingEmotionCmd;
-    bool hasPendingEmotion = false;
+    const uint32_t RECONNECT_TIMEOUT_MS = 15000;
+    bool newConfigSaved = false, pendingCalibrateMpu = false, hasPendingEmotion = false;
 
 public:
-    WiFiProvisioner() 
-        : serialBufIndex(0), 
-          isReconnecting(false), 
-          reconnectStartMs(0), 
-          newConfigSaved(false),
-          pendingCalibrateMpu(false),
-          hasPendingEmotion(false) {}
+    WiFiProvisioner() = default;
 
-    /**
-     * @brief Inicializa NVS y carga credenciales guardadas o aplica defaults.
-     */
-    void init(const char* defaultSsid = "TU_RED_WIFI", 
-              const char* defaultPass = "TU_PASSWORD", 
-              const char* defaultServer = DEFAULT_SERVER) {
+    void init(
+        const char* defaultSsid = "TU_RED_WIFI",
+        const char* defaultPass = "TU_PASSWORD",
+        const char* defaultServer = DEFAULT_SERVER
+    ) {
         WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
             static uint32_t lastDiscLog = 0;
             if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
@@ -88,13 +44,9 @@ public:
         });
 
         if (!prefs.begin(PREFS_NAMESPACE, false)) {
-            Serial.println("[PROVISIONER] [WARN] No se pudo abrir NVS. Utilizando credenciales por defecto.");
-            ssid = defaultSsid;
-            password = defaultPass;
-            server = defaultServer;
+            ssid = defaultSsid; password = defaultPass; server = defaultServer;
             return;
         }
-
         ssid = prefs.getString("ssid", defaultSsid);
         password = prefs.getString("pass", defaultPass);
         server = prefs.getString("server", defaultServer);
@@ -103,11 +55,6 @@ public:
             prefs.putString("server", server);
         }
         prefs.end();
-
-        Serial.println("[PROVISIONER] [OK] Credenciales cargadas desde NVS ('air-config'):");
-        Serial.printf("  - SSID: %s\n", ssid.c_str());
-        Serial.printf("  - Pass: %s\n", password.length() > 0 ? "********" : "[VACIA]");
-        Serial.printf("  - Server: %s\n", server.c_str());
     }
 
     const String& getSSID() const { return ssid; }
@@ -115,117 +62,55 @@ public:
     const String& getServer() const { return server; }
 
     String getMqttHost() const {
-        String s = server;
-        s.trim();
-        if (s.startsWith("https://")) {
-            s = s.substring(8);
-        } else if (s.startsWith("http://")) {
-            s = s.substring(7);
-        }
+        String s = server; s.trim();
+        if (s.startsWith("https://")) s = s.substring(8);
+        else if (s.startsWith("http://")) s = s.substring(7);
         int slashIdx = s.indexOf('/');
-        if (slashIdx >= 0) {
-            s = s.substring(0, slashIdx);
-        }
+        if (slashIdx >= 0) s = s.substring(0, slashIdx);
         int colonIdx = s.indexOf(':');
-        if (colonIdx >= 0) {
-            s = s.substring(0, colonIdx);
-        }
+        if (colonIdx >= 0) s = s.substring(0, colonIdx);
         return s;
     }
 
     String buildBaseUrl(uint16_t lanPort = 3002) const {
-        String s = server;
-        s.trim();
-        if (s.length() == 0) {
-            s = DEFAULT_SERVER;
-        }
-        while (s.endsWith("/")) {
-            s.remove(s.length() - 1);
-        }
-        if (s.startsWith("http://") || s.startsWith("https://")) {
-            return s;
-        }
+        String s = server; s.trim();
+        if (s.length() == 0) s = DEFAULT_SERVER;
+        while (s.endsWith("/")) s.remove(s.length() - 1);
+        if (s.startsWith("http://") || s.startsWith("https://")) return s;
         if (s.indexOf(".ts.net") >= 0) {
-            if (s.indexOf(':') >= 0) {
-                return String("https://") + s;
-            }
-            return String("https://") + s + ":10000";
+            return (s.indexOf(':') >= 0) ? (String("https://") + s) : (String("https://") + s + ":10000");
         }
-        if (s.indexOf(':') >= 0) {
-            return String("http://") + s;
-        }
-        return String("http://") + s + ":" + String(lanPort);
+        return (s.indexOf(':') >= 0) ? (String("http://") + s) : (String("http://") + s + ":" + String(lanPort));
     }
 
-    String getIngestUrl() const {
-        return buildBaseUrl(3002) + "/api/telemetry/ingest";
-    }
+    String getIngestUrl() const { return buildBaseUrl(3002) + "/api/telemetry/ingest"; }
+    String getBackendUrl(uint16_t port = 3002) const { return buildBaseUrl(port) + "/api/telemetry/batch"; }
 
-    String getBackendUrl(uint16_t port = 3002) const {
-        return buildBaseUrl(port) + "/api/telemetry/batch";
-    }
-
-    /**
-     * @brief Inicia la conexión inicial o tras boot en modo no-bloqueante
-     */
     void startConnection() {
-        WiFi.mode(WIFI_STA);
-        WiFi.disconnect();
-        delay(20);
+        WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(20);
         WiFi.begin(ssid.c_str(), password.c_str());
-        isReconnecting = true;
-        reconnectStartMs = millis();
-        pendingSsid = ssid;
+        isReconnecting = true; reconnectStartMs = millis(); pendingSsid = ssid;
     }
 
-    /**
-     * @brief Guarda en NVS de forma persistente
-     */
     bool saveCredentials(const String& newSsid, const String& newPass, const String& newServer) {
-        if (!prefs.begin(PREFS_NAMESPACE, false)) {
-            Serial.println("[PROVISIONER] [ERROR] Fallo al abrir NVS para escritura.");
-            return false;
-        }
-
+        if (!prefs.begin(PREFS_NAMESPACE, false)) return false;
         prefs.putString("ssid", newSsid);
         prefs.putString("pass", newPass);
         prefs.putString("server", newServer);
         prefs.end();
-
-        ssid = newSsid;
-        password = newPass;
-        server = newServer;
+        ssid = newSsid; password = newPass; server = newServer;
         newConfigSaved = true;
-
-        Serial.println("[PROVISIONER] [OK] Nuevas credenciales persistidas en NVS ('air-config').");
         return true;
     }
 
-    /**
-     * @brief Indica si se guardó una nueva configuración que requiera rearmar clientes (p. ej. MQTT)
-     */
-    bool consumeNewConfigFlag() {
-        bool val = newConfigSaved;
-        newConfigSaved = false;
-        return val;
-    }
-
-    bool consumeCalibrateMpuFlag() {
-        bool val = pendingCalibrateMpu;
-        pendingCalibrateMpu = false;
-        return val;
-    }
-
+    bool consumeNewConfigFlag() { bool val = newConfigSaved; newConfigSaved = false; return val; }
+    bool consumeCalibrateMpuFlag() { bool val = pendingCalibrateMpu; pendingCalibrateMpu = false; return val; }
     bool consumeEmotionCommand(String& outEmotion) {
         if (!hasPendingEmotion) return false;
-        outEmotion = pendingEmotionCmd;
-        hasPendingEmotion = false;
+        outEmotion = pendingEmotionCmd; hasPendingEmotion = false;
         return true;
     }
 
-    /**
-     * @brief Revisa Serial.available() de forma completamente no-bloqueante
-     */
     void processSerial(const TelemetryContext& ctx) {
         int linesProcessed = 0;
         while (Serial.available() > 0 && linesProcessed < 4) {
@@ -233,196 +118,63 @@ public:
             if (c == '\n' || c == '\r') {
                 if (serialBufIndex > 0) {
                     serialBuffer[serialBufIndex] = '\0';
-                    String line(serialBuffer);
-                    serialBufIndex = 0;
-                    line.trim();
-                    if (line.length() == 0) continue;
-                    if (!line.startsWith("{")) continue;
+                    String line(serialBuffer); serialBufIndex = 0; line.trim();
+                    if (line.length() == 0 || !line.startsWith("{")) continue;
                     linesProcessed++;
                     handleJsonCommandLine(line.c_str(), ctx);
                 }
+            } else if (serialBufIndex < SERIAL_BUF_SIZE - 1) {
+                serialBuffer[serialBufIndex++] = c;
             } else {
-                if (serialBufIndex < SERIAL_BUF_SIZE - 1) {
-                    serialBuffer[serialBufIndex++] = c;
-                } else {
-                    // Prevenir buffer overflow por saturación o ruido en la línea
-                    serialBufIndex = 0;
-                }
+                serialBufIndex = 0;
             }
         }
     }
 
-    /**
-     * @brief Monitorea el estado de la reconexión asíncrona e informa por Serial
-     */
     void updateConnectionStatus() {
         if (!isReconnecting) return;
-
         if (WiFi.status() == WL_CONNECTED) {
             isReconnecting = false;
             JsonDocument res;
-            res["status"] = "CONNECTED";
-            res["ssid"] = pendingSsid;
-            res["ip"] = WiFi.localIP().toString();
-            res["rssi"] = WiFi.RSSI();
-
-            serializeJson(res, Serial);
-            Serial.println();
+            res["status"] = "CONNECTED"; res["ssid"] = pendingSsid;
+            res["ip"] = WiFi.localIP().toString(); res["rssi"] = WiFi.RSSI();
+            serializeJson(res, Serial); Serial.println();
         } else if (millis() - reconnectStartMs >= RECONNECT_TIMEOUT_MS) {
             isReconnecting = false;
-            JsonDocument res;
-            res["status"] = "FAILED";
-            res["ssid"] = pendingSsid;
-            res["error"] = "TIMEOUT_CONNECTING";
-
-            serializeJson(res, Serial);
-            Serial.println();
+            SerialCliHandler::sendQuickJsonAck(nullptr, "FAILED", "error", "TIMEOUT_CONNECTING");
         }
     }
 
 private:
     void handleJsonCommandLine(const char* line, const TelemetryContext& ctx) {
         JsonDocument doc;
-        DeserializationError err = deserializeJson(doc, line);
-        if (err) {
-            // Ignorar basura en la línea o líneas que no sean JSON
-            return;
-        }
-
+        if (deserializeJson(doc, line)) return;
         const char* cmd = doc["cmd"];
-        if (!cmd) return;
-        if (doc["status"].is<const char*>() || doc["network"].is<JsonObject>()) return;
+        if (!cmd || doc["status"].is<const char*>() || doc["network"].is<JsonObject>()) return;
 
         if (strcmp(cmd, "SET_WIFI") == 0) {
-            handleSetWifiCommand(doc);
+            const char* newSsid = doc["ssid"] | "";
+            const char* newPass = doc["pass"] | "";
+            const char* newServer = doc["server"] | server.c_str();
+            if (strlen(newSsid) == 0) {
+                SerialCliHandler::sendQuickJsonAck(nullptr, "ERROR", "error", "MISSING_SSID");
+                return;
+            }
+            saveCredentials(newSsid, newPass, newServer);
+            SerialCliHandler::sendQuickJsonAck(nullptr, "CONNECTING", "ssid", newSsid);
+            WiFi.disconnect(); delay(20); WiFi.begin(newSsid, newPass);
+            isReconnecting = true; reconnectStartMs = millis(); pendingSsid = newSsid;
         } else if (strcmp(cmd, "GET_STATUS") == 0) {
-            handleGetStatusCommand(ctx);
+            SerialCliHandler::sendStatusReport(ctx, ssid, server, getIngestUrl());
         } else if (strcmp(cmd, "SCAN_I2C") == 0) {
-            handleScanI2CCommand();
+            SerialCliHandler::handleScanI2CCommand();
         } else if (strcmp(cmd, "CALIBRATE_MPU") == 0) {
             pendingCalibrateMpu = true;
-            JsonDocument res;
-            res["cmd"] = "CALIBRATE_MPU";
-            res["status"] = "OK";
-            serializeJson(res, Serial);
-            Serial.println();
+            SerialCliHandler::sendQuickJsonAck("CALIBRATE_MPU", "OK");
         } else if (strcmp(cmd, "SET_EMOTION") == 0) {
             const char* emo = doc["emotion"] | "OPTIMAL";
-            pendingEmotionCmd = String(emo);
-            hasPendingEmotion = true;
-            JsonDocument res;
-            res["cmd"] = "SET_EMOTION";
-            res["status"] = "OK";
-            res["emotion"] = emo;
-            serializeJson(res, Serial);
-            Serial.println();
+            pendingEmotionCmd = String(emo); hasPendingEmotion = true;
+            SerialCliHandler::sendQuickJsonAck("SET_EMOTION", "OK", "emotion", emo);
         }
-    }
-
-    void handleScanI2CCommand() {
-        JsonDocument res;
-        res["cmd"] = "I2C_RESULT";
-        JsonArray arr = res["devices"].to<JsonArray>();
-        for (uint8_t a = 1; a < 127; a++) {
-            Wire.beginTransmission(a);
-            if (Wire.endTransmission() == 0) {
-                char hexStr[8];
-                snprintf(hexStr, sizeof(hexStr), "0x%02X", a);
-                arr.add(hexStr);
-            }
-        }
-        serializeJson(res, Serial);
-        Serial.println();
-    }
-
-    void handleSetWifiCommand(const JsonDocument& doc) {
-        const char* newSsid = doc["ssid"] | "";
-        const char* newPass = doc["pass"] | "";
-        const char* newServer = doc["server"] | server.c_str();
-
-        if (strlen(newSsid) == 0) {
-            JsonDocument errDoc;
-            errDoc["status"] = "ERROR";
-            errDoc["error"] = "MISSING_SSID";
-            serializeJson(errDoc, Serial);
-            Serial.println();
-            return;
-        }
-
-        // 1. Guardar en NVS
-        saveCredentials(newSsid, newPass, newServer);
-
-        // 2. Responder confirmación inmediata por Serial
-        JsonDocument ack;
-        ack["status"] = "CONNECTING";
-        ack["ssid"] = newSsid;
-        serializeJson(ack, Serial);
-        Serial.println();
-
-        // 3. Iniciar reconexión asíncrona de inmediato
-        WiFi.disconnect();
-        delay(20);
-        WiFi.begin(newSsid, newPass);
-        isReconnecting = true;
-        reconnectStartMs = millis();
-        pendingSsid = newSsid;
-    }
-
-    void buildStatusJson(JsonDocument& report, const TelemetryContext& ctx) {
-        report["cmd"] = "STATUS";
-
-        // Estado de red
-        JsonObject net = report["network"].to<JsonObject>();
-        bool connected = (WiFi.status() == WL_CONNECTED);
-        net["connected"] = connected;
-        net["ssid"] = connected ? WiFi.SSID() : ssid;
-        net["ip"] = connected ? WiFi.localIP().toString() : "0.0.0.0";
-        net["rssi"] = connected ? WiFi.RSSI() : 0;
-        net["mac"] = WiFi.macAddress();
-        net["server"] = server;
-        net["ingest_url"] = getIngestUrl();
-        net["mqtt_connected"] = ctx.mqttConnected;
-
-        // Estado de hardware
-        JsonObject hw = report["hardware"].to<JsonObject>();
-        hw["free_heap"] = ESP.getFreeHeap();
-        hw["min_free_heap"] = ESP.getMinFreeHeap();
-        hw["cpu_freq_mhz"] = ESP.getCpuFreqMHz();
-        hw["uptime_s"] = millis() / 1000;
-        hw["core"] = xPortGetCoreID();
-
-        // Sensores
-        JsonObject sens = report["sensors"].to<JsonObject>();
-        sens["ppm"] = round(ctx.ppm * 10) / 10.0;
-        sens["co_ppm"] = round(ctx.co_ppm * 10) / 10.0;
-        sens["temperature"] = round(ctx.temperature * 10) / 10.0;
-        sens["humidity"] = round(ctx.humidity * 10) / 10.0;
-        sens["delta_ppm"] = round(ctx.deltaPpm * 10) / 10.0;
-        sens["raw_adc135"] = ctx.raw135;
-        sens["raw_adc7"] = ctx.raw7;
-        sens["mpu_connected"] = ctx.hasMpu;
-        sens["emotion"] = ctx.emotion ? ctx.emotion : "OPTIMAL";
-        sens["view_mode"] = ctx.viewMode ? ctx.viewMode : "FACE";
-        sens["eye_x"] = round(ctx.eyeX * 100) / 100.0;
-        sens["eye_y"] = round(ctx.eyeY * 100) / 100.0;
-        sens["pitch"] = round(ctx.pitch * 10) / 10.0;
-        sens["roll"] = round(ctx.roll * 10) / 10.0;
-        sens["ax"] = round(ctx.ax * 100) / 100.0;
-        sens["ay"] = round(ctx.ay * 100) / 100.0;
-        sens["az"] = round(ctx.az * 100) / 100.0;
-        sens["is_shaking"] = ctx.isShaking;
-        sens["shake_energy"] = round(ctx.shakeEnergy * 10) / 10.0;
-        sens["baby_rock_score"] = round(ctx.babyRockScore * 10) / 10.0;
-
-        // Almacenamiento LittleFS / Buffer Offline
-        JsonObject storage = report["storage"].to<JsonObject>();
-        storage["offline_pending"] = ctx.offlinePending;
-    }
-
-    void handleGetStatusCommand(const TelemetryContext& ctx) {
-        JsonDocument report;
-        buildStatusJson(report, ctx);
-        serializeJson(report, Serial);
-        Serial.println();
     }
 };

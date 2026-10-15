@@ -7,9 +7,6 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 
-/**
- * Estructura de muestra para buffer offline
- */
 struct OfflineTelemetryRecord {
     const char* deviceId;
     uint32_t timestamp;
@@ -24,7 +21,7 @@ struct OfflineTelemetryRecord {
 class OfflineBufferManager {
 private:
     const char* filePath = "/offline_queue.jsonl";
-    const size_t MAX_FILE_SIZE = 300 * 1024; // 300 KB max en LittleFS (~3500 muestras)
+    const size_t MAX_FILE_SIZE = 300 * 1024;
     size_t pendingCount = 0;
     bool isMounted = false;
 
@@ -44,8 +41,36 @@ private:
         pendingCount = count;
     }
 
+    bool sendBatchPayload(const String& payload, const char* backendUrl, PubSubClient* mqttClient) {
+        if (backendUrl && strlen(backendUrl) > 0) {
+            String urlStr(backendUrl);
+            WiFiClientSecure secureClient;
+            WiFiClient plainClient;
+            HTTPClient http;
+            if (urlStr.startsWith("https://")) {
+                secureClient.setInsecure();
+                http.begin(secureClient, urlStr);
+            } else {
+                http.begin(plainClient, urlStr);
+            }
+            http.addHeader("Content-Type", "application/json");
+            http.setTimeout(3000);
+            int httpCode = http.POST(payload);
+            http.end();
+            if (httpCode == 200 || httpCode == 201 || httpCode == 400) {
+                return true;
+            }
+        }
+        if (mqttClient && mqttClient->connected()) {
+            if (mqttClient->publish("airguardian/telemetry/batch", payload.c_str())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
 public:
-    OfflineBufferManager() {}
+    OfflineBufferManager() = default;
 
     bool init() {
         if (!LittleFS.begin(true)) {
@@ -59,20 +84,17 @@ public:
             LittleFS.remove(filePath);
             pendingCount = 0;
         }
-        Serial.printf("[OFFLINE-FS] LittleFS montado con éxito. Muestras pendientes en cola: %u\n", (unsigned int)pendingCount);
+        Serial.printf("[OFFLINE-FS] LittleFS montado. Pendientes: %u\n", (unsigned int)pendingCount);
         return true;
     }
 
     bool storeRecord(const OfflineTelemetryRecord& rec) {
         if (!isMounted) return false;
 
-        // Comprobación de cuota máxima de archivo
         if (LittleFS.exists(filePath)) {
             File checkFile = LittleFS.open(filePath, "r");
             if (checkFile && checkFile.size() > MAX_FILE_SIZE) {
                 checkFile.close();
-                Serial.println("[OFFLINE-FS] Buffer lleno. Rotando archivo para proteger la flash...");
-                // Eliminamos para evitar saturar almacenamiento si estuvo desconectado semanas
                 LittleFS.remove(filePath);
                 pendingCount = 0;
             } else if (checkFile) {
@@ -81,10 +103,7 @@ public:
         }
 
         File file = LittleFS.open(filePath, "a");
-        if (!file) {
-            Serial.println("[OFFLINE-FS] Error al abrir archivo para anexar muestra.");
-            return false;
-        }
+        if (!file) return false;
 
         JsonDocument doc;
         doc["device_id"] = rec.deviceId;
@@ -101,27 +120,14 @@ public:
         file.close();
 
         pendingCount++;
-        Serial.printf("[OFFLINE-FS] Muestra encolada localmente. Total acumulado: %u\n", (unsigned int)pendingCount);
         return true;
     }
 
-    size_t getPendingCount() const {
-        return pendingCount;
-    }
+    size_t getPendingCount() const { return pendingCount; }
+    bool hasPendingData() const { return pendingCount > 0; }
 
-    bool hasPendingData() const {
-        return pendingCount > 0;
-    }
-
-    /**
-     * Vaciado y sincronización masiva hacia el Backend al recuperar WiFi.
-     * Envía lotes de 15 muestras vía HTTP POST a /api/telemetry/batch
-     * o por MQTT si HTTP falla.
-     */
     bool flushToBackend(const char* backendUrl, PubSubClient* mqttClient = nullptr) {
         if (!isMounted || !hasPendingData()) return true;
-
-        Serial.printf("[OFFLINE-SYNC] Iniciando vaciado de buffer (%u muestras acumuladas)...\n", (unsigned int)pendingCount);
 
         File file = LittleFS.open(filePath, "r");
         if (!file) {
@@ -135,7 +141,6 @@ public:
         JsonDocument batchDoc;
         JsonArray samplesArray = batchDoc["samples"].to<JsonArray>();
         size_t currentBatchCount = 0;
-        size_t totalSent = 0;
 
         while (file.available()) {
             String line = file.readStringUntil('\n');
@@ -143,11 +148,8 @@ public:
             if (line.length() < 5) continue;
 
             JsonDocument itemDoc;
-            DeserializationError err = deserializeJson(itemDoc, line);
-            if (!err) {
-                if (itemDoc["timestamp"].as<uint32_t>() == 0) {
-                    itemDoc["timestamp"] = 1;
-                }
+            if (!deserializeJson(itemDoc, line)) {
+                if (itemDoc["timestamp"].as<uint32_t>() == 0) itemDoc["timestamp"] = 1;
                 samplesArray.add(itemDoc);
                 currentBatchCount++;
             }
@@ -156,69 +158,26 @@ public:
                 String payload;
                 serializeJson(batchDoc, payload);
 
-                bool batchSuccess = false;
-
-                // 1. Intentar HTTP POST primero (óptimo para lotes grandes)
-                if (backendUrl && strlen(backendUrl) > 0) {
-                    String urlStr(backendUrl);
-                    int httpCode = -1;
-                    WiFiClientSecure secureClient;
-                    WiFiClient plainClient;
-                    HTTPClient http;
-                    if (urlStr.startsWith("https://")) {
-                        secureClient.setInsecure();
-                        http.begin(secureClient, urlStr);
-                    } else {
-                        http.begin(plainClient, urlStr);
-                    }
-                    http.addHeader("Content-Type", "application/json");
-                    http.setTimeout(3000); // Evitar congelar Core 0 si el backend no responde
-                    httpCode = http.POST(payload);
-                    if (httpCode == 200 || httpCode == 201 || httpCode == 400) {
-                        batchSuccess = true;
-                        totalSent += currentBatchCount;
-                        Serial.printf("[OFFLINE-SYNC] Lote de %u enviado por HTTP (Código %d). Progreso: %u\n",
-                                      (unsigned int)currentBatchCount, httpCode, (unsigned int)totalSent);
-                    } else {
-                        Serial.printf("[OFFLINE-SYNC] HTTP falló (código %d). Reintentando por MQTT...\n", httpCode);
-                    }
-                    http.end();
-                }
-
-                // 2. Fallback a MQTT si HTTP falló o no se configuró
-                if (!batchSuccess && mqttClient && mqttClient->connected()) {
-                    if (mqttClient->publish("airguardian/telemetry/batch", payload.c_str())) {
-                        batchSuccess = true;
-                        totalSent += currentBatchCount;
-                        Serial.printf("[OFFLINE-SYNC] Lote de %u enviado vía MQTT.\n", (unsigned int)currentBatchCount);
-                    }
-                }
-
-                if (!batchSuccess) {
-                    Serial.println("[OFFLINE-SYNC] Error enviando lote. Se conservarán los datos restantes.");
+                if (!sendBatchPayload(payload, backendUrl, mqttClient)) {
                     allFlushedSuccessfully = false;
                     break;
                 }
 
-                // Reiniciar para el siguiente lote
                 batchDoc.clear();
                 samplesArray = batchDoc["samples"].to<JsonArray>();
                 currentBatchCount = 0;
-                vTaskDelay(pdMS_TO_TICKS(150)); // Pequeña pausa para descongestionar el socket
+                vTaskDelay(pdMS_TO_TICKS(150));
             }
         }
 
         file.close();
 
-        // Si se vació exitosamente todo el histórico acumulado, limpiamos el archivo
         if (allFlushedSuccessfully) {
             LittleFS.remove(filePath);
             pendingCount = 0;
-            Serial.printf("[OFFLINE-SYNC] ¡SINCRONIZACIÓN EXITOSA! %u registros volcados al Data Lake.\n", (unsigned int)totalSent);
             return true;
-        } else {
-            updatePendingCount();
-            return false;
         }
+        updatePendingCount();
+        return false;
     }
 };
