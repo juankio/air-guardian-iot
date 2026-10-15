@@ -40,9 +40,15 @@ private:
     // Físicas MPU
     int16_t ax = 0, ay = 0, az = 0;
     int16_t gx = 0, gy = 0, gz = 0;
+    float smoothAx = 0.0f, smoothAy = 0.0f, smoothAz = 8192.0f;
+    bool smoothInitialized = false;
+    float offsetAx = 0.0f;
+    float offsetAy = 0.0f;
+    bool calibrated = false;
     float normAx = 0.0f, normAy = 0.0f, normAz = 1.0f;
     float pitchDeg = 0.0f, rollDeg = 0.0f;
     bool shakingState = false;
+    uint8_t shakeHitCount = 0;
 
 public:
     SensorManager() : dht(PIN_DHT, DHT_TYPE), bootTimeMs(0) {}
@@ -136,6 +142,7 @@ public:
                 mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_4);
                 mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_500);
                 Serial.printf("[MPU-6050] OK: Sensor inicializado en 0x%02X (WHO_AM_I: 0x%02X)\n", mpuAddr, whoAmI);
+                calibrateRestingOffset();
             } else {
                 Serial.printf("[MPU-6050] WARN: Fallo testConnection() (WHO_AM_I: 0x%02X)\n", whoAmI);
             }
@@ -160,6 +167,42 @@ public:
         return hasMpu;
     }
 
+    void calibrateRestingOffset() {
+        if (!hasMpu) return;
+        float sumAx = 0.0f;
+        float sumAy = 0.0f;
+        float sumAz = 0.0f;
+        const int samples = 20;
+        for (int i = 0; i < samples; i++) {
+            int16_t rAx = 0, rAy = 0, rAz = 0, rGx = 0, rGy = 0, rGz = 0;
+            mpu.getMotion6(&rAx, &rAy, &rAz, &rGx, &rGy, &rGz);
+            sumAx += (float)rAx / 8192.0f;
+            sumAy += (float)rAy / 8192.0f;
+            sumAz += (float)rAz / 8192.0f;
+            if (i == samples - 1) {
+                smoothAx = (float)rAx;
+                smoothAy = (float)rAy;
+                smoothAz = (float)rAz;
+                smoothInitialized = true;
+            }
+            delay(4);
+        }
+        float avgAx = sumAx / (float)samples;
+        float avgAy = sumAy / (float)samples;
+        float avgAz = sumAz / (float)samples;
+        if (fabsf(avgAx) < 0.45f && fabsf(avgAy) < 0.45f && avgAz > 0.75f) {
+            offsetAx = avgAx;
+            offsetAy = avgAy;
+            calibrated = true;
+            Serial.printf("[MPU-6050] Auto-Tare OK: offsetAx=%.3fG, offsetAy=%.3fG (avgAz=%.3fG)\n", offsetAx, offsetAy, avgAz);
+        } else {
+            offsetAx = 0.23f;
+            offsetAy = 0.13f;
+            calibrated = true;
+            Serial.printf("[MPU-6050] Auto-Tare Fallback: offsetAx=%.3fG, offsetAy=%.3fG\n", offsetAx, offsetAy);
+        }
+    }
+
     void updateMPU(float& targetEyeX, float& targetEyeY, bool& shake) {
         if (!hasMpu) {
             targetEyeX = 0;
@@ -174,26 +217,67 @@ public:
             return;
         }
 
-        mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+        int16_t rawAx = 0, rawAy = 0, rawAz = 0;
+        mpu.getMotion6(&rawAx, &rawAy, &rawAz, &gx, &gy, &gz);
+        ax = rawAx;
+        ay = rawAy;
+        az = rawAz;
 
-        // Normalizar aceleración a rango G con escala +/-4G (8192 LSB/G)
-        normAx = (float)ax / 8192.0f;
-        normAy = (float)ay / 8192.0f;
-        normAz = (float)az / 8192.0f;
+        if (!smoothInitialized) {
+            smoothAx = (float)rawAx;
+            smoothAy = (float)rawAy;
+            smoothAz = (float)rawAz;
+            smoothInitialized = true;
+        } else {
+            smoothAx = (0.40f * (float)rawAx) + (0.60f * smoothAx);
+            smoothAy = (0.40f * (float)rawAy) + (0.60f * smoothAy);
+            smoothAz = (0.40f * (float)rawAz) + (0.60f * smoothAz);
+        }
 
-        // Calcular inclinación Pitch y Roll en grados
-        pitchDeg = atan2f(-normAx, sqrtf(normAy * normAy + normAz * normAz)) * 57.2957795f;
-        rollDeg  = atan2f(normAy, sqrtf(normAx * normAx + normAz * normAz)) * 57.2957795f;
+        float rawNormAx = (float)rawAx / 8192.0f;
+        float rawNormAy = (float)rawAy / 8192.0f;
+        float rawNormAz = (float)rawAz / 8192.0f;
 
-        // Asignar inclinación de ojos (físicas de gravedad)
-        targetEyeX = constrain(normAy * 12.0f, -10.0f, 10.0f);
-        targetEyeY = constrain(-normAx * 10.0f, -8.0f, 8.0f);
+        normAx = smoothAx / 8192.0f;
+        normAy = smoothAy / 8192.0f;
+        normAz = smoothAz / 8192.0f;
 
-        // Cálculo de shake sensible y multieje:
-        // Calcular aceleración dinámica neta restando la gravedad (1.0G)
-        float totalAccel = sqrtf(normAx * normAx + normAy * normAy + normAz * normAz);
-        float dynamicAccel = fabsf(totalAccel - 1.0f);
-        shake = (dynamicAccel > 0.65f || abs(gx) > 8000 || abs(gy) > 8000 || abs(gz) > 8000);
+        float calAx = normAx - offsetAx;
+        float calAy = normAy - offsetAy;
+
+        if (fabsf(calAx) < 0.04f) calAx = 0.0f;
+        if (fabsf(calAy) < 0.04f) calAy = 0.0f;
+
+        float planarMag = sqrtf(calAx * calAx + calAy * calAy);
+        if (planarMag < 0.08f && normAz > 0.65f) {
+            rollDeg = 0.0f;
+            pitchDeg = 0.0f;
+        } else {
+            float upY = -calAx + (normAz * 0.34f);
+            rollDeg = atan2f(calAy, upY) * 180.0f / PI;
+
+            float rawPitch = atan2f(calAx, fmaxf(0.15f, normAz)) * 180.0f / PI * 0.45f;
+            float pitchFade = constrain(1.0f - (fabsf(rollDeg) - 85.0f) / 50.0f, 0.0f, 1.0f);
+            pitchDeg = constrain(rawPitch * pitchFade, -60.0f, 60.0f);
+        }
+
+        if (fabsf(rollDeg) < 2.2f) rollDeg = 0.0f;
+        if (fabsf(pitchDeg) < 2.2f) pitchDeg = 0.0f;
+
+        targetEyeX = constrain(rollDeg / 9.0f, -10.0f, 10.0f);
+        targetEyeY = constrain(pitchDeg / 9.0f, -10.0f, 10.0f);
+
+        normAx = calAx;
+        normAy = calAy;
+
+        float totalG = sqrtf(rawNormAx * rawNormAx + rawNormAy * rawNormAy + rawNormAz * rawNormAz);
+        float dynamicAccel = fabsf(totalG - 1.0f);
+        if (dynamicAccel > 1.15f) {
+            if (shakeHitCount < 10) shakeHitCount++;
+        } else if (shakeHitCount > 0) {
+            shakeHitCount--;
+        }
+        shake = (shakeHitCount >= 4);
         shakingState = shake;
     }
 

@@ -54,13 +54,15 @@ private:
     const uint32_t RECONNECT_TIMEOUT_MS = 15000; // 15 segundos max para intentar handshake WiFi
     String pendingSsid;
     bool newConfigSaved = false;
+    bool pendingCalibrateMpu = false;
 
 public:
     WiFiProvisioner() 
         : serialBufIndex(0), 
           isReconnecting(false), 
           reconnectStartMs(0), 
-          newConfigSaved(false) {}
+          newConfigSaved(false),
+          pendingCalibrateMpu(false) {}
 
     /**
      * @brief Inicializa NVS y carga credenciales guardadas o aplica defaults.
@@ -203,17 +205,29 @@ public:
         return val;
     }
 
+    bool consumeCalibrateMpuFlag() {
+        bool val = pendingCalibrateMpu;
+        pendingCalibrateMpu = false;
+        return val;
+    }
+
     /**
      * @brief Revisa Serial.available() de forma completamente no-bloqueante
      */
     void processSerial(const TelemetryContext& ctx) {
-        while (Serial.available() > 0) {
+        int linesProcessed = 0;
+        while (Serial.available() > 0 && linesProcessed < 4) {
             char c = (char)Serial.read();
             if (c == '\n' || c == '\r') {
                 if (serialBufIndex > 0) {
                     serialBuffer[serialBufIndex] = '\0';
-                    handleJsonCommandLine(serialBuffer, ctx);
+                    String line(serialBuffer);
                     serialBufIndex = 0;
+                    line.trim();
+                    if (line.length() == 0) continue;
+                    if (!line.startsWith("{")) continue;
+                    linesProcessed++;
+                    handleJsonCommandLine(line.c_str(), ctx);
                 }
             } else {
                 if (serialBufIndex < SERIAL_BUF_SIZE - 1) {
@@ -265,6 +279,7 @@ private:
 
         const char* cmd = doc["cmd"];
         if (!cmd) return;
+        if (doc["status"].is<const char*>() || doc["network"].is<JsonObject>()) return;
 
         if (strcmp(cmd, "SET_WIFI") == 0) {
             handleSetWifiCommand(doc);
@@ -272,12 +287,12 @@ private:
             handleGetStatusCommand(ctx);
         } else if (strcmp(cmd, "SCAN_I2C") == 0) {
             handleScanI2CCommand();
-        } else {
-            JsonDocument errDoc;
-            errDoc["status"] = "ERROR";
-            errDoc["error"] = "UNKNOWN_COMMAND";
-            errDoc["cmd"] = cmd;
-            serializeJson(errDoc, Serial);
+        } else if (strcmp(cmd, "CALIBRATE_MPU") == 0) {
+            pendingCalibrateMpu = true;
+            JsonDocument res;
+            res["cmd"] = "CALIBRATE_MPU";
+            res["status"] = "OK";
+            serializeJson(res, Serial);
             Serial.println();
         }
     }
@@ -366,8 +381,8 @@ private:
         sens["mpu_connected"] = ctx.hasMpu;
         sens["emotion"] = ctx.emotion ? ctx.emotion : "OPTIMAL";
         sens["view_mode"] = ctx.viewMode ? ctx.viewMode : "FACE";
-        sens["eye_x"] = round(ctx.eyeX * 10) / 10.0;
-        sens["eye_y"] = round(ctx.eyeY * 10) / 10.0;
+        sens["eye_x"] = round(ctx.eyeX * 100) / 100.0;
+        sens["eye_y"] = round(ctx.eyeY * 100) / 100.0;
         sens["pitch"] = round(ctx.pitch * 10) / 10.0;
         sens["roll"] = round(ctx.roll * 10) / 10.0;
         sens["ax"] = round(ctx.ax * 100) / 100.0;

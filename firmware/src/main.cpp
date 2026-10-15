@@ -174,12 +174,12 @@ void TaskRenderCore1(void* parameter) {
         bool shake = false;
         sensors.updateMPU(eyeX, eyeY, shake);
 
-        // 2. Gestionar cambio de vista si se sacude el dispositivo
+        // 2. Gestionar estado mareado si se sacude el dispositivo (manteniendo rostro expresivo)
         uint32_t now = millis();
         if (shake && (now - lastShakeToggle > 2000)) {
             lastShakeToggle = now;
             portENTER_CRITICAL(&stateMutex);
-            sharedState.viewMode = (sharedState.viewMode == VIEW_PET_FACE) ? VIEW_CIRCULAR_HUD : VIEW_PET_FACE;
+            sharedState.viewMode = VIEW_PET_FACE;
             dizzyUntilMs = now + 3500;
             sharedState.emotion = EMOTION_DIZZY;
             sharedState.shakeDetected = true;
@@ -230,6 +230,13 @@ void TaskTelemetryCore0(void* parameter) {
     uint32_t lastPublishMs = 0;
     uint32_t lastOfflineStoreMs = 0;
     bool wasOffline = true;
+
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+    WiFiClient plainClient;
+    HTTPClient http;
+    http.setReuse(true);
+    String activeIngestUrl = "";
 
     for (;;) {
         // 1. Muestreo y filtrado de sensores ambientales
@@ -297,10 +304,12 @@ void TaskTelemetryCore0(void* parameter) {
         provCtx.raw135 = rawAdc;
         provCtx.raw7 = rawAdc7;
         provCtx.deltaPpm = deltaPpm;
+        float encodedProvEyeX = roundf((snapState.roll / 9.0f) * 100.0f) / 100.0f;
+        float encodedProvEyeY = roundf((snapState.pitch / 9.0f) * 100.0f) / 100.0f;
         provCtx.emotion = emotionToString(snapState.emotion);
         provCtx.viewMode = (snapState.viewMode == VIEW_PET_FACE) ? "FACE" : "HUD";
-        provCtx.eyeX = snapState.targetEyeX;
-        provCtx.eyeY = snapState.targetEyeY;
+        provCtx.eyeX = encodedProvEyeX;
+        provCtx.eyeY = encodedProvEyeY;
         provCtx.pitch = snapState.pitch;
         provCtx.roll = snapState.roll;
         provCtx.ax = snapState.ax;
@@ -309,6 +318,9 @@ void TaskTelemetryCore0(void* parameter) {
         provCtx.isShaking = isShakingNow;
 
         wifiProvisioner.processSerial(provCtx);
+        if (wifiProvisioner.consumeCalibrateMpuFlag()) {
+            sensors.calibrateRestingOffset();
+        }
         wifiProvisioner.updateConnectionStatus();
 
         // Si se persistió un nuevo servidor vía comando SET_WIFI, reconfigurar MQTT
@@ -358,8 +370,8 @@ void TaskTelemetryCore0(void* parameter) {
                 wasOffline = false;
             }
 
-            // 5. Publicar Telemetría al Data Lake cada 1 segundo vía HTTP/HTTPS REST
-            if (now - lastPublishMs >= 1000) {
+            // 5. Publicar Telemetría al Data Lake cada 250ms (4 Hz) vía HTTP/HTTPS Keep-Alive
+            if (now - lastPublishMs >= 250) {
                 lastPublishMs = now;
 
                 portENTER_CRITICAL(&stateMutex);
@@ -389,9 +401,11 @@ void TaskTelemetryCore0(void* parameter) {
                 doc["Status"] = emotionStr;
                 doc["emotion"] = emotionStr;
                 doc["view_mode"] = viewModeStr;
+                float encodedEyeX = roundf((snapState.roll / 9.0f) * 100.0f) / 100.0f;
+                float encodedEyeY = roundf((snapState.pitch / 9.0f) * 100.0f) / 100.0f;
                 doc["mpu_connected"] = sensors.isMpuConnected();
-                doc["eye_x"] = round(snapState.targetEyeX * 10) / 10.0;
-                doc["eye_y"] = round(snapState.targetEyeY * 10) / 10.0;
+                doc["eye_x"] = encodedEyeX;
+                doc["eye_y"] = encodedEyeY;
                 doc["pitch"] = round(snapState.pitch * 10) / 10.0;
                 doc["roll"] = round(snapState.roll * 10) / 10.0;
                 doc["ax"] = round(snapState.ax * 100) / 100.0;
@@ -407,23 +421,28 @@ void TaskTelemetryCore0(void* parameter) {
                 String jsonPayload;
                 serializeJson(doc, jsonPayload);
 
-                // Ingesta directa HTTP/HTTPS a la API de NestJS
+                // Ingesta directa HTTP/HTTPS a la API de NestJS con Keep-Alive (TLS reuse)
                 String ingestUrl = wifiProvisioner.getIngestUrl();
-                WiFiClientSecure secureClient;
-                WiFiClient plainClient;
-                HTTPClient http;
+                if (activeIngestUrl != ingestUrl) {
+                    http.end();
+                    activeIngestUrl = ingestUrl;
+                }
 
                 if (ingestUrl.startsWith("https://")) {
-                    secureClient.setInsecure();
                     http.begin(secureClient, ingestUrl);
                 } else {
                     http.begin(plainClient, ingestUrl);
                 }
+                http.setReuse(true);
                 http.addHeader("Content-Type", "application/json");
-                http.setTimeout(3000);
+                http.setTimeout(2500);
                 int code = http.POST(jsonPayload);
                 if (code == 200 || code == 201) {
-                    Serial.printf("[HTTP-LIVE] Muestra publicada a %s (Code %d)\n", ingestUrl.c_str(), code);
+                    static uint32_t lastHttpLogMs = 0;
+                    if (now - lastHttpLogMs >= 1000) {
+                        lastHttpLogMs = now;
+                        Serial.printf("[HTTP-LIVE] Muestra publicada a %s (Code %d)\n", ingestUrl.c_str(), code);
+                    }
                     String respPayload = http.getString();
                     if (respPayload.length() > 0) {
                         JsonDocument respDoc;
@@ -454,8 +473,15 @@ void TaskTelemetryCore0(void* parameter) {
                             portEXIT_CRITICAL(&stateMutex);
                         }
                     }
+                    http.end();
+                } else if (code < 0) {
+                    secureClient.stop();
+                    plainClient.stop();
+                    http.end();
+                    activeIngestUrl = "";
+                } else {
+                    http.end();
                 }
-                http.end();
             }
         } else {
             // MODO OFFLINE: Sin conexión WiFi/Internet
@@ -488,6 +514,6 @@ void TaskTelemetryCore0(void* parameter) {
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(25));
     }
 }
