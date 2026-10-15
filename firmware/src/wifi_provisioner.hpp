@@ -33,6 +33,8 @@ public:
         float ay;
         float az;
         bool isShaking;
+        float shakeEnergy;
+        float babyRockScore;
     };
 
 private:
@@ -55,6 +57,8 @@ private:
     String pendingSsid;
     bool newConfigSaved = false;
     bool pendingCalibrateMpu = false;
+    String pendingEmotionCmd;
+    bool hasPendingEmotion = false;
 
 public:
     WiFiProvisioner() 
@@ -62,7 +66,8 @@ public:
           isReconnecting(false), 
           reconnectStartMs(0), 
           newConfigSaved(false),
-          pendingCalibrateMpu(false) {}
+          pendingCalibrateMpu(false),
+          hasPendingEmotion(false) {}
 
     /**
      * @brief Inicializa NVS y carga credenciales guardadas o aplica defaults.
@@ -211,6 +216,13 @@ public:
         return val;
     }
 
+    bool consumeEmotionCommand(String& outEmotion) {
+        if (!hasPendingEmotion) return false;
+        outEmotion = pendingEmotionCmd;
+        hasPendingEmotion = false;
+        return true;
+    }
+
     /**
      * @brief Revisa Serial.available() de forma completamente no-bloqueante
      */
@@ -292,6 +304,16 @@ private:
             JsonDocument res;
             res["cmd"] = "CALIBRATE_MPU";
             res["status"] = "OK";
+            serializeJson(res, Serial);
+            Serial.println();
+        } else if (strcmp(cmd, "SET_EMOTION") == 0) {
+            const char* emo = doc["emotion"] | "OPTIMAL";
+            pendingEmotionCmd = String(emo);
+            hasPendingEmotion = true;
+            JsonDocument res;
+            res["cmd"] = "SET_EMOTION";
+            res["status"] = "OK";
+            res["emotion"] = emo;
             serializeJson(res, Serial);
             Serial.println();
         }
@@ -389,6 +411,8 @@ private:
         sens["ay"] = round(ctx.ay * 100) / 100.0;
         sens["az"] = round(ctx.az * 100) / 100.0;
         sens["is_shaking"] = ctx.isShaking;
+        sens["shake_energy"] = round(ctx.shakeEnergy * 10) / 10.0;
+        sens["baby_rock_score"] = round(ctx.babyRockScore * 10) / 10.0;
 
         // Almacenamiento LittleFS / Buffer Offline
         JsonObject storage = report["storage"].to<JsonObject>();

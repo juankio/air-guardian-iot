@@ -32,19 +32,60 @@ WiFiProvisioner wifiProvisioner;
 DisplaySharedState sharedState;
 portMUX_TYPE stateMutex = portMUX_INITIALIZER_UNLOCKED;
 
-// Variable de temporizador para emoción mareada (DIZZY)
-volatile uint32_t dizzyUntilMs = 0;
+// Temporizadores de máquina de estados física y emocional (Emo-Mecha v3.0)
+volatile uint32_t manualEmotionUntilMs = 0;
+volatile PetEmotion manualEmotion = EMOTION_OPTIMAL;
 
-// Conversor de emoción a cadena JSON
-const char* emotionToString(PetEmotion emotion) {
-    switch (emotion) {
-        case EMOTION_OPTIMAL: return "OPTIMAL";
-        case EMOTION_PREDICTIVE_WARNING: return "PREDICTIVE_WARNING";
-        case EMOTION_CRITICAL: return "CRITICAL";
-        case EMOTION_RECOVERY: return "RECOVERY";
-        case EMOTION_SLEEPING: return "SLEEPING";
-        case EMOTION_DIZZY: return "DIZZY";
-        default: return "OPTIMAL";
+volatile uint32_t vomitSeqStartMs = 0;
+volatile uint32_t nauseaUntilMs = 0;
+volatile uint32_t dizzyUntilMs = 0;
+volatile uint32_t startledUntilMs = 0;
+volatile uint32_t babySleepUntilMs = 0;
+volatile uint32_t babyRockUntilMs = 0;
+
+// Carrusel autónomo Tamagotchi (17 animaciones de vida cuando está en reposo)
+static const PetEmotion IDLE_CAROUSEL[] = {
+    EMOTION_WINK,
+    EMOTION_BUBBLEGUM,
+    EMOTION_WHISTLE,
+    EMOTION_LOVE,
+    EMOTION_GLASSES_COOL,
+    EMOTION_COFFEE,
+    EMOTION_RAMEN,
+    EMOTION_MUSIC_VIBE,
+    EMOTION_BUTTERFLY,
+    EMOTION_DETECTIVE,
+    EMOTION_DERP,
+    EMOTION_SUSPICIOUS,
+    EMOTION_YAWN,
+    EMOTION_SNEEZE,
+    EMOTION_ZEN,
+    EMOTION_LAUGHING,
+    EMOTION_CRYING
+};
+static constexpr size_t IDLE_CAROUSEL_COUNT = sizeof(IDLE_CAROUSEL) / sizeof(IDLE_CAROUSEL[0]);
+
+void applyExternalEmotionCommand(const char* emoName) {
+    PetEmotion parsed = EMOTION_OPTIMAL;
+    if (stringToEmotion(emoName, parsed)) {
+        uint32_t now = millis();
+        portENTER_CRITICAL(&stateMutex);
+        sharedState.viewMode = VIEW_PET_FACE;
+        if (parsed == EMOTION_OPTIMAL) {
+            manualEmotionUntilMs = 0;
+            vomitSeqStartMs = 0;
+            nauseaUntilMs = 0;
+            dizzyUntilMs = 0;
+            startledUntilMs = 0;
+            babySleepUntilMs = 0;
+            babyRockUntilMs = 0;
+            sharedState.emotion = EMOTION_OPTIMAL;
+        } else {
+            manualEmotion = parsed;
+            manualEmotionUntilMs = now + 8000;
+            sharedState.emotion = parsed;
+        }
+        portEXIT_CRITICAL(&stateMutex);
     }
 }
 
@@ -52,7 +93,7 @@ const char* emotionToString(PetEmotion emotion) {
 void TaskTelemetryCore0(void* parameter);
 void TaskRenderCore1(void* parameter);
 
-// Callback MQTT para recibir alertas predictivas desde el backend
+// Callback MQTT para recibir alertas predictivas o comandos desde el backend
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
     char message[256];
     if (length >= sizeof(message)) length = sizeof(message) - 1;
@@ -62,21 +103,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     JsonDocument doc;
     DeserializationError error = deserializeJson(doc, message);
     if (!error) {
-        const char* alert = doc["predicted_status"];
+        const char* alert = doc["predicted_status"] | doc["command_emotion"];
         if (alert) {
-            portENTER_CRITICAL(&stateMutex);
-            if (strcmp(alert, "WARNING_PREDICTIVE") == 0 || strcmp(alert, "PREDICTIVE_WARNING") == 0) {
-                sharedState.emotion = EMOTION_PREDICTIVE_WARNING;
-            } else if (strcmp(alert, "CRITICAL") == 0) {
-                sharedState.emotion = EMOTION_CRITICAL;
-            } else if (strcmp(alert, "OPTIMAL") == 0) {
-                sharedState.emotion = EMOTION_OPTIMAL;
-            } else if (strcmp(alert, "RECOVERY") == 0) {
-                sharedState.emotion = EMOTION_RECOVERY;
-            } else if (strcmp(alert, "DIZZY") == 0) {
-                sharedState.emotion = EMOTION_DIZZY;
-            }
-            portEXIT_CRITICAL(&stateMutex);
+            applyExternalEmotionCommand(alert);
         }
         if (doc["command_view_mode"].is<const char*>()) {
             const char* vm = doc["command_view_mode"];
@@ -96,7 +125,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 void setup() {
     WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Desactivar detector de brownout por consumo de calentadores MQ
     Serial.begin(115200);
-    Serial.println("\n[AIR GUARDIAN] Iniciando Sistema Dual-Core...");
+    Serial.println("\n[AIR GUARDIAN] Iniciando Sistema Dual-Core (Emo-Mecha v3.0)...");
 
     // Inicializar estado compartido
     sharedState.emotion = EMOTION_OPTIMAL;
@@ -154,7 +183,6 @@ void setup() {
 }
 
 void loop() {
-    // El loop queda libre para el sistema de FreeRTOS
     vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
@@ -166,40 +194,143 @@ void TaskRenderCore1(void* parameter) {
     const TickType_t xFrequency = pdMS_TO_TICKS(16); // ~60 Hz (16.6ms)
 
     DisplaySharedState localState;
-    uint32_t lastShakeToggle = 0;
 
     for (;;) {
-        // 1. Leer MPU-6050 a alta velocidad
+        // 1. Leer MPU-6050 a 60 Hz y actualizar acumuladores de energía
         float eyeX = 0, eyeY = 0;
         bool shake = false;
         sensors.updateMPU(eyeX, eyeY, shake);
 
-        // 2. Gestionar estado mareado si se sacude el dispositivo (manteniendo rostro expresivo)
         uint32_t now = millis();
-        if (shake && (now - lastShakeToggle > 2000)) {
-            lastShakeToggle = now;
-            portENTER_CRITICAL(&stateMutex);
-            sharedState.viewMode = VIEW_PET_FACE;
-            dizzyUntilMs = now + 3500;
-            sharedState.emotion = EMOTION_DIZZY;
-            sharedState.shakeDetected = true;
-            portEXIT_CRITICAL(&stateMutex);
+        float shakeEnergy = sensors.getShakeEnergy();
+        float babyRockScore = sensors.getBabyRockScore();
+        float dynAccel = sensors.getDynamicAccel();
+        float jerk = sensors.getJerk();
+        float roll = sensors.getRoll();
+        float pitch = sensors.getPitch();
+        bool freefall = sensors.isFreefalling();
+
+        // 2. Evaluar Máquina de Estados Física Progresiva (Sacudida 4 Etapas + Mecer Bebé)
+        if (vomitSeqStartMs == 0) {
+            if (shakeEnergy >= 62.0f) {
+                // Etapa 3: ¡Vómito + Limpiaparabrisas!
+                vomitSeqStartMs = now;
+                nauseaUntilMs = 0;
+                dizzyUntilMs = 0;
+                babySleepUntilMs = 0;
+                babyRockUntilMs = 0;
+                sensors.resetBabyRockScore();
+            } else if (shakeEnergy >= 35.0f) {
+                // Etapa 2: Náusea (cara verde aguantando las ganas de vomitar)
+                if (now + 4000 > nauseaUntilMs) nauseaUntilMs = now + 4000;
+                babySleepUntilMs = 0;
+                babyRockUntilMs = 0;
+            } else if (shakeEnergy >= 12.0f) {
+                // Etapa 1: Mareo (ojos en espiral y estrellas)
+                if (now + 4000 > dizzyUntilMs) dizzyUntilMs = now + 4000;
+                babySleepUntilMs = 0;
+                babyRockUntilMs = 0;
+            }
         }
 
-        // 3. Copiar estado atómicamente
+        // Detector de despertar con susto (STARTLED) si estaba durmiendo como bebé y lo sacuden
+        if (babySleepUntilMs > now) {
+            if (dynAccel > 0.35f || jerk > 0.45f || shakeEnergy >= 12.0f) {
+                babySleepUntilMs = 0;
+                babyRockUntilMs = 0;
+                sensors.resetBabyRockScore();
+                startledUntilMs = now + 2500;
+            }
+        } else if (vomitSeqStartMs == 0 && nauseaUntilMs <= now && dizzyUntilMs <= now && startledUntilMs <= now) {
+            // Progresión de Mecer como un bebé
+            if (babyRockScore >= 55.0f) {
+                babySleepUntilMs = now + 20000;
+            } else if (babyRockScore >= 22.0f) {
+                if (now + 3500 > babyRockUntilMs) babyRockUntilMs = now + 3500;
+            }
+        }
+
+        // 3. Resolver emoción prioritaria y sincronizar estado compartido
         portENTER_CRITICAL(&stateMutex);
         sharedState.targetEyeX = eyeX;
         sharedState.targetEyeY = eyeY;
-        sharedState.pitch = sensors.getPitch();
-        sharedState.roll = sensors.getRoll();
+        sharedState.pitch = pitch;
+        sharedState.roll = roll;
         sharedState.ax = sensors.getNormAx();
         sharedState.ay = sensors.getNormAy();
         sharedState.az = sensors.getNormAz();
-        if (shake) {
-            sharedState.shakeDetected = true;
-        } else if (now >= dizzyUntilMs) {
-            sharedState.shakeDetected = false;
+
+        float currentPpm = sharedState.ppm;
+        float currentCo = sharedState.co_ppm;
+        float currentTemp = sharedState.temperature;
+        float deltaPpm = sensors.getDeltaPPM();
+        bool warmingUp = sensors.isWarmingUp();
+
+        PetEmotion resolvedEmotion = EMOTION_OPTIMAL;
+        bool activeShakeFlag = shake;
+
+        if (manualEmotionUntilMs > now) {
+            resolvedEmotion = manualEmotion;
+        } else if (vomitSeqStartMs > 0) {
+            uint32_t elapsed = now - vomitSeqStartMs;
+            activeShakeFlag = true;
+            sharedState.viewMode = VIEW_PET_FACE;
+            if (elapsed < 4000) {
+                resolvedEmotion = EMOTION_VOMIT;
+            } else if (elapsed < 7500) {
+                resolvedEmotion = EMOTION_WIPER;
+            } else if (elapsed < 9500) {
+                resolvedEmotion = EMOTION_RECOVERY;
+                sensors.resetShakeEnergy();
+            } else {
+                vomitSeqStartMs = 0;
+                resolvedEmotion = EMOTION_OPTIMAL;
+                activeShakeFlag = false;
+            }
+        } else if (nauseaUntilMs > now) {
+            resolvedEmotion = EMOTION_NAUSEA;
+            activeShakeFlag = true;
+            sharedState.viewMode = VIEW_PET_FACE;
+        } else if (dizzyUntilMs > now) {
+            resolvedEmotion = EMOTION_DIZZY;
+            activeShakeFlag = true;
+            sharedState.viewMode = VIEW_PET_FACE;
+        } else if (startledUntilMs > now) {
+            resolvedEmotion = EMOTION_STARTLED;
+            sharedState.viewMode = VIEW_PET_FACE;
+        } else if (babySleepUntilMs > now) {
+            resolvedEmotion = EMOTION_BABY_SLEEP;
+            sharedState.viewMode = VIEW_PET_FACE;
+        } else if (babyRockUntilMs > now) {
+            resolvedEmotion = EMOTION_BABY_ROCKING;
+            sharedState.viewMode = VIEW_PET_FACE;
+        } else if (freefall) {
+            resolvedEmotion = EMOTION_FREEFALL;
+        } else if (fabsf(roll) > 135.0f) {
+            resolvedEmotion = EMOTION_UPSIDE_DOWN;
+        } else if (roll < -48.0f) {
+            resolvedEmotion = EMOTION_WALL_LEFT;
+        } else if (roll > 48.0f) {
+            resolvedEmotion = EMOTION_WALL_RIGHT;
+        } else if (!warmingUp && (currentCo >= 30.0f || currentPpm >= 1500.0f)) {
+            resolvedEmotion = EMOTION_CRITICAL;
+        } else if (!warmingUp && (deltaPpm > 45.0f || currentPpm > 1100.0f)) {
+            resolvedEmotion = EMOTION_GAS_MASK;
+        } else if (!warmingUp && currentTemp >= 41.5f && ((now / 3500) % 12 == 0)) {
+            resolvedEmotion = EMOTION_HOT_PANTING;
+        } else {
+            // Carrusel Autónomo Tamagotchi: cada 8 segundos (4.5s OPTIMAL + 3.5s Animación Viva)
+            uint32_t cyclePos = now % 8000;
+            if (cyclePos >= 4500) {
+                size_t idx = (now / 8000) % IDLE_CAROUSEL_COUNT;
+                resolvedEmotion = IDLE_CAROUSEL[idx];
+            } else {
+                resolvedEmotion = EMOTION_OPTIMAL;
+            }
         }
+
+        sharedState.emotion = resolvedEmotion;
+        sharedState.shakeDetected = activeShakeFlag;
         localState = sharedState;
         portEXIT_CRITICAL(&stateMutex);
 
@@ -211,7 +342,6 @@ void TaskRenderCore1(void* parameter) {
         if ((nowTicks - xLastWakeTime) < xFrequency) {
             vTaskDelayUntil(&xLastWakeTime, xFrequency);
         } else {
-            // Si el render tomó >= 16ms, resetear referencia temporal y ceder CPU a IDLE1
             xLastWakeTime = nowTicks;
             vTaskDelay(pdMS_TO_TICKS(2));
         }
@@ -253,44 +383,17 @@ void TaskTelemetryCore0(void* parameter) {
 
         uint32_t now = millis();
 
-        // 2. Actualizar variables compartidas para el render en Core 1
+        // 2. Actualizar variables ambientales compartidas (Core 1 resuelve la emoción a 60Hz)
         DisplaySharedState snapState;
         portENTER_CRITICAL(&stateMutex);
         sharedState.ppm = currentPpm;
         sharedState.co_ppm = currentCo;
         sharedState.temperature = currentTemp;
         sharedState.humidity = currentHum;
-
-        // Histéresis completa
-        if (now < 25000 || sensors.isWarmingUp()) {
-            // Durante warm-up (< 25s), mantener EMOTION_OPTIMAL
-            sharedState.emotion = EMOTION_OPTIMAL;
-        } else if (dizzyUntilMs > now) {
-            // Si dizzyUntilMs > now, mantener EMOTION_DIZZY
-            sharedState.emotion = EMOTION_DIZZY;
-        } else if (sharedState.emotion != EMOTION_SLEEPING) {
-            if (currentCo >= 30.0f || currentPpm >= 1500.0f) {
-                sharedState.emotion = EMOTION_CRITICAL;
-            } else if (sharedState.emotion == EMOTION_CRITICAL) {
-                // Para EMOTION_CRITICAL, salir a RECOVERY si currentPpm < 1000 && currentCo < 25
-                if (currentPpm < 1000.0f && currentCo < 25.0f) {
-                    sharedState.emotion = EMOTION_RECOVERY;
-                }
-            } else if (deltaPpm > 45.0f || currentPpm > 1100.0f) {
-                sharedState.emotion = EMOTION_PREDICTIVE_WARNING;
-            } else if (currentPpm < 800.0f) {
-                sharedState.emotion = EMOTION_OPTIMAL;
-            } else {
-                // Rama else que no quede bloqueada
-                if (sharedState.emotion == EMOTION_DIZZY) {
-                    sharedState.emotion = EMOTION_OPTIMAL;
-                }
-            }
-        }
         snapState = sharedState;
         portEXIT_CRITICAL(&stateMutex);
 
-        bool isShakingNow = snapState.shakeDetected || sensors.isShaking() || (dizzyUntilMs > now) || (snapState.emotion == EMOTION_DIZZY);
+        bool isShakingNow = snapState.shakeDetected || sensors.isShaking();
 
         // 3. Procesar comandos Serial CLI y Aprovisionamiento WiFi (No bloqueante)
         WiFiProvisioner::TelemetryContext provCtx;
@@ -316,10 +419,16 @@ void TaskTelemetryCore0(void* parameter) {
         provCtx.ay = snapState.ay;
         provCtx.az = snapState.az;
         provCtx.isShaking = isShakingNow;
+        provCtx.shakeEnergy = sensors.getShakeEnergy();
+        provCtx.babyRockScore = sensors.getBabyRockScore();
 
         wifiProvisioner.processSerial(provCtx);
         if (wifiProvisioner.consumeCalibrateMpuFlag()) {
             sensors.calibrateRestingOffset();
+        }
+        String serialEmotion;
+        if (wifiProvisioner.consumeEmotionCommand(serialEmotion)) {
+            applyExternalEmotionCommand(serialEmotion.c_str());
         }
         wifiProvisioner.updateConnectionStatus();
 
@@ -341,7 +450,6 @@ void TaskTelemetryCore0(void* parameter) {
                               WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
             }
 
-            // Quitar intento bloqueante de MQTT cuando se usa HTTPS / Tailscale Funnel (solo HTTP/HTTPS en puerto 10000)
             static uint32_t lastMqttAttemptMs = 0;
             String currentSrv = wifiProvisioner.getServer();
             bool isHttpsOrFunnel = currentSrv.startsWith("https://") || (currentSrv.indexOf(".ts.net") >= 0);
@@ -361,7 +469,6 @@ void TaskTelemetryCore0(void* parameter) {
                 }
             }
 
-            // Si veníamos de estar desconectados o hay datos pendientes en LittleFS, vaciar hacia el servidor
             static uint32_t lastOfflineFlushAttemptMs = 0;
             if (wasOffline || (offlineBuffer.hasPendingData() && (now - lastOfflineFlushAttemptMs >= 15000))) {
                 lastOfflineFlushAttemptMs = now;
@@ -380,7 +487,7 @@ void TaskTelemetryCore0(void* parameter) {
 
                 PetEmotion currentEmotion = snapState.emotion;
                 DisplayViewMode currentViewMode = snapState.viewMode;
-                bool currentShaking = snapState.shakeDetected || sensors.isShaking() || (dizzyUntilMs > now) || (currentEmotion == EMOTION_DIZZY);
+                bool currentShaking = snapState.shakeDetected || sensors.isShaking();
                 const char* emotionStr = emotionToString(currentEmotion);
                 const char* viewModeStr = (currentViewMode == VIEW_PET_FACE) ? "FACE" : "HUD";
                 size_t pendingCount = offlineBuffer.getPendingCount();
@@ -412,6 +519,8 @@ void TaskTelemetryCore0(void* parameter) {
                 doc["ay"] = round(snapState.ay * 100) / 100.0;
                 doc["az"] = round(snapState.az * 100) / 100.0;
                 doc["is_shaking"] = currentShaking;
+                doc["shake_energy"] = round(sensors.getShakeEnergy() * 10) / 10.0;
+                doc["baby_rock_score"] = round(sensors.getBabyRockScore() * 10) / 10.0;
                 doc["free_heap"] = ESP.getFreeHeap();
                 doc["min_free_heap"] = ESP.getMinFreeHeap();
                 doc["uptime_s"] = now / 1000;
@@ -421,7 +530,6 @@ void TaskTelemetryCore0(void* parameter) {
                 String jsonPayload;
                 serializeJson(doc, jsonPayload);
 
-                // Ingesta directa HTTP/HTTPS a la API de NestJS con Keep-Alive (TLS reuse)
                 String ingestUrl = wifiProvisioner.getIngestUrl();
                 if (activeIngestUrl != ingestUrl) {
                     http.end();
@@ -441,36 +549,31 @@ void TaskTelemetryCore0(void* parameter) {
                     static uint32_t lastHttpLogMs = 0;
                     if (now - lastHttpLogMs >= 1000) {
                         lastHttpLogMs = now;
-                        Serial.printf("[HTTP-LIVE] Muestra publicada a %s (Code %d)\n", ingestUrl.c_str(), code);
+                        Serial.printf("[HTTP-LIVE] Muestra publicada a %s (Code %d | Emotion: %s)\n", ingestUrl.c_str(), code, emotionStr);
                     }
                     String respPayload = http.getString();
                     if (respPayload.length() > 0) {
                         JsonDocument respDoc;
                         DeserializationError err = deserializeJson(respDoc, respPayload);
                         if (!err) {
-                            portENTER_CRITICAL(&stateMutex);
                             if (respDoc["command_view_mode"].is<const char*>()) {
                                 const char* vm = respDoc["command_view_mode"];
                                 if (vm) {
+                                    portENTER_CRITICAL(&stateMutex);
                                     if (strcmp(vm, "HUD") == 0 || strcmp(vm, "VIEW_CIRCULAR_HUD") == 0) {
                                         sharedState.viewMode = VIEW_CIRCULAR_HUD;
                                     } else if (strcmp(vm, "FACE") == 0 || strcmp(vm, "VIEW_PET_FACE") == 0) {
                                         sharedState.viewMode = VIEW_PET_FACE;
                                     }
+                                    portEXIT_CRITICAL(&stateMutex);
                                 }
                             }
                             if (respDoc["command_emotion"].is<const char*>()) {
                                 const char* emo = respDoc["command_emotion"];
                                 if (emo) {
-                                    if (strcmp(emo, "OPTIMAL") == 0) sharedState.emotion = EMOTION_OPTIMAL;
-                                    else if (strcmp(emo, "PREDICTIVE_WARNING") == 0 || strcmp(emo, "WARNING_PREDICTIVE") == 0) sharedState.emotion = EMOTION_PREDICTIVE_WARNING;
-                                    else if (strcmp(emo, "CRITICAL") == 0) sharedState.emotion = EMOTION_CRITICAL;
-                                    else if (strcmp(emo, "RECOVERY") == 0) sharedState.emotion = EMOTION_RECOVERY;
-                                    else if (strcmp(emo, "SLEEPING") == 0) sharedState.emotion = EMOTION_SLEEPING;
-                                    else if (strcmp(emo, "DIZZY") == 0) sharedState.emotion = EMOTION_DIZZY;
+                                    applyExternalEmotionCommand(emo);
                                 }
                             }
-                            portEXIT_CRITICAL(&stateMutex);
                         }
                     }
                     http.end();
@@ -484,10 +587,8 @@ void TaskTelemetryCore0(void* parameter) {
                 }
             }
         } else {
-            // MODO OFFLINE: Sin conexión WiFi/Internet
             wasOffline = true;
 
-            // Reintentar conexión Wi-Fi periódicamente suavemente cada 25 segundos (sin WiFi.disconnect() destructivo)
             static uint32_t lastWifiRetryMs = 0;
             if (now - lastWifiRetryMs >= 25000) {
                 lastWifiRetryMs = now;
@@ -497,7 +598,6 @@ void TaskTelemetryCore0(void* parameter) {
                 }
             }
 
-            // Guardar lecturas en buffer persistente de flash cada 2 segundos
             if (now - lastOfflineStoreMs >= 2000) {
                 lastOfflineStoreMs = now;
                 OfflineTelemetryRecord rec;

@@ -51,6 +51,20 @@ private:
     bool shakingState = false;
     uint8_t shakeHitCount = 0;
 
+    // Físicas Avanzadas v3.0: Acumulador Progresivo de Mareo/Vómito y Mecer Bebé
+    float prevRawAx = 0.0f;
+    float prevRawAy = 0.0f;
+    float prevRawAz = 1.0f;
+    float prevRollDeg = 0.0f;
+    bool prevRawInitialized = false;
+    float currentDynamicAccel = 0.0f;
+    float currentJerk = 0.0f;
+    float shakeEnergy = 0.0f;
+    uint32_t lastShakeInputMs = 0;
+    float babyRockScore = 0.0f;
+    uint32_t lastRockMs = 0;
+    bool freefallDetected = false;
+
 public:
     SensorManager() : dht(PIN_DHT, DHT_TYPE), bootTimeMs(0) {}
 
@@ -217,6 +231,9 @@ public:
             pitchDeg = 0.0f;
             rollDeg = 0.0f;
             shakingState = false;
+            shakeEnergy = 0.0f;
+            babyRockScore = 0.0f;
+            freefallDetected = false;
             return;
         }
 
@@ -257,11 +274,6 @@ public:
             rollDeg = 0.0f;
             pitchDeg = 0.0f;
         } else {
-            // En el chasis físico:
-            // - Recto en la mano (orejas arriba): calAy ≈ +0.92G, calAx ≈ 0 -> upY > 0 -> rollDeg = 0°
-            // - Plano en la mesa (boca arriba): calAx ≈ 0, calAy ≈ 0, normAz ≈ +0.98G -> upY > 0 -> rollDeg = 0°
-            // - De lado horizontal (oreja a oreja): calAx ≈ ∓0.92G, calAy ≈ 0 -> rollDeg = ±90°
-            // - De cabeza (orejas abajo): calAy ≈ -0.92G, calAx ≈ 0 -> upY < 0 -> rollDeg = ±180°
             float upY = calAy + (normAz * 0.35f);
             rollDeg = atan2f(-calAx, upY) * 180.0f / PI;
 
@@ -281,14 +293,60 @@ public:
         normAx = calAx;
         normAy = calAy;
 
+        // 1. Magnitud G total, aceleración dinámica y Jerk (derivada frame a frame a 60Hz)
         float totalG = sqrtf(rawNormAx * rawNormAx + rawNormAy * rawNormAy + rawNormAz * rawNormAz);
         float dynamicAccel = fabsf(totalG - 1.0f);
-        if (dynamicAccel > 1.15f) {
-            if (shakeHitCount < 10) shakeHitCount++;
-        } else if (shakeHitCount > 0) {
-            shakeHitCount--;
+        currentDynamicAccel = dynamicAccel;
+
+        if (!prevRawInitialized) {
+            prevRawAx = rawNormAx;
+            prevRawAy = rawNormAy;
+            prevRawAz = rawNormAz;
+            prevRollDeg = rollDeg;
+            prevRawInitialized = true;
         }
-        shake = (shakeHitCount >= 4);
+
+        float jerk = fabsf(rawNormAx - prevRawAx) + fabsf(rawNormAy - prevRawAy) + fabsf(rawNormAz - prevRawAz);
+        prevRawAx = rawNormAx;
+        prevRawAy = rawNormAy;
+        prevRawAz = rawNormAz;
+        currentJerk = jerk;
+
+        freefallDetected = (totalG < 0.22f);
+
+        uint32_t nowMs = millis();
+
+        // 2. Acumulador Progresivo de Sacudida (DIZZY -> NAUSEA -> VOMIT -> WIPER)
+        if (dynamicAccel > 0.28f || jerk > 0.42f) {
+            shakeEnergy = fminf(100.0f, shakeEnergy + (dynamicAccel * 4.2f + jerk * 2.5f));
+            lastShakeInputMs = nowMs;
+            babyRockScore = fmaxf(0.0f, babyRockScore - 4.0f);
+        } else {
+            if (nowMs - lastShakeInputMs > 1200) {
+                shakeEnergy = fmaxf(0.0f, shakeEnergy - 0.45f);
+            }
+        }
+
+        // 3. Detector de "Mecer como un bebé" (Vaivén suave -> Chupete -> Dormir con burbuja)
+        float rollDelta = fabsf(rollDeg - prevRollDeg);
+        prevRollDeg = rollDeg;
+        float gyroRate = (fabsf((float)gx) + fabsf((float)gy) + fabsf((float)gz)) / 65.5f;
+
+        bool gentleRockMotion = (shakeEnergy < 10.0f) &&
+                                (dynamicAccel < 0.26f) &&
+                                (jerk < 0.36f) &&
+                                (fabsf(rollDeg) < 62.0f) &&
+                                ((rollDelta > 0.28f && rollDelta < 4.8f) ||
+                                 (gyroRate > 14.0f && gyroRate < 115.0f && dynamicAccel > 0.035f));
+
+        if (gentleRockMotion) {
+            babyRockScore = fminf(100.0f, babyRockScore + 0.90f);
+            lastRockMs = nowMs;
+        } else if (nowMs - lastRockMs > 2500) {
+            babyRockScore = fmaxf(0.0f, babyRockScore - 0.35f);
+        }
+
+        shake = (shakeEnergy >= 12.0f) || (dynamicAccel > 0.45f);
         shakingState = shake;
     }
 
@@ -375,6 +433,14 @@ public:
     float getNormAz() const { return normAz; }
     bool isShaking() const { return shakingState; }
     bool isMpuConnected() const { return hasMpu; }
+    float getShakeEnergy() const { return shakeEnergy; }
+    void resetShakeEnergy() { shakeEnergy = 0.0f; }
+    float getBabyRockScore() const { return babyRockScore; }
+    void resetBabyRockScore() { babyRockScore = 0.0f; }
+    float getDynamicAccel() const { return currentDynamicAccel; }
+    float getJerk() const { return currentJerk; }
+    bool isFreefalling() const { return freefallDetected; }
+    uint32_t getLastRockMs() const { return lastRockMs; }
     void getRawMPU(int16_t& _ax, int16_t& _ay, int16_t& _az, int16_t& _gx, int16_t& _gy, int16_t& _gz) {
         _ax = ax; _ay = ay; _az = az;
         _gx = gx; _gy = gy; _gz = gz;
