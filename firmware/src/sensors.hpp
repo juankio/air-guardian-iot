@@ -16,7 +16,7 @@ private:
 
     float emaMq135 = 0;
     float emaMq7   = 0;
-    const float alpha = 0.15f;
+    const float alpha = 0.30f;
 
     float currentPpm = 400.0f;
     float currentCoPpm = 0.0f;
@@ -73,6 +73,7 @@ public:
         }
         float raw135 = sum135 / 16.0f;
         float raw7   = sum7 / 16.0f;
+        float adcJitter = constrain((raw135 - emaMq135) * 0.25f, -2.5f, 2.5f);
 
         emaMq135 = (alpha * raw135) + ((1.0f - alpha) * emaMq135);
         emaMq7   = (alpha * raw7)   + ((1.0f - alpha) * emaMq7);
@@ -104,24 +105,34 @@ public:
         float rawV7 = (emaMq7 / 4095.0f) * 3.3f;
         currentVoltage7 = constrain(rawV7, 0.02f, 3.15f);
 
-        float computedPpm = 400.0f + powf(10.0f, (currentVoltage135 * 1.25f)) * envFactor;
-        computedPpm = constrain(computedPpm, 380.0f, 3000.0f);
+        float basePpm = 398.0f + (currentVoltage135 * 145.0f * envFactor) + adcJitter;
+        float gasSurge = (currentVoltage135 > 0.35f)
+            ? powf((currentVoltage135 - 0.35f) * 3.1f, 1.85f) * 480.0f * envFactor
+            : 0.0f;
+        float computedPpm = constrain(basePpm + gasSurge, 390.0f, 5000.0f);
+        float smoothPpm = constrain(computedPpm - adcJitter, 390.0f, 5000.0f);
 
-        float computedCo = constrain(currentVoltage7 * 15.0f * envFactor, 0.0f, 200.0f);
+        float computedCo = (currentVoltage7 <= 1.15f)
+            ? (currentVoltage7 / 1.15f) * 3.2f * envFactor
+            : (3.2f + powf((currentVoltage7 - 1.15f) * 2.8f, 1.7f) * 28.0f) * envFactor;
+        computedCo = constrain(computedCo, 0.4f, 200.0f);
 
         if (isWarmingUp()) {
-            currentPpm = constrain(computedPpm, 380.0f, 450.0f);
-            currentCoPpm = constrain(computedCo, 0.0f, 1.5f);
+            currentPpm = constrain(computedPpm, 390.0f, 485.0f);
+            currentCoPpm = constrain(computedCo, 0.4f, 3.5f);
+            lastPpm = smoothPpm;
             deltaPpm = 0.0f;
         } else {
             currentPpm = computedPpm;
             currentCoPpm = computedCo;
 
             uint32_t now = millis();
-            if (now - lastPpmSampleMs >= 5000) {
+            if (now - lastPpmSampleMs >= 3000) {
                 float timeSec = (now - lastPpmSampleMs) / 1000.0f;
-                deltaPpm = ((currentPpm - lastPpm) / timeSec) * 60.0f;
-                lastPpm = currentPpm;
+                float rawDelta = ((smoothPpm - lastPpm) / timeSec) * 60.0f;
+                deltaPpm = (0.30f * rawDelta) + (0.70f * deltaPpm);
+                if (fabsf(deltaPpm) < 1.2f) deltaPpm = 0.0f;
+                lastPpm = smoothPpm;
                 lastPpmSampleMs = now;
             }
         }

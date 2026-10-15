@@ -24,20 +24,13 @@ static const EmotionNameEntry EMOTION_MAP[] = {
     {"WARNING_PREDICTIVE", EMOTION_PREDICTIVE_WARNING}, {"CRITICAL", EMOTION_CRITICAL}, {"RECOVERY", EMOTION_RECOVERY}
 };
 
-static const PetEmotion IDLE_GREEN_GESTURES[] = {
-    EMOTION_WINK, EMOTION_RECOVERY, EMOTION_SUSPICIOUS,
-    EMOTION_WHISTLE, EMOTION_YAWN, EMOTION_LAUGHING
-};
+static const PetEmotion IDLE_GREEN_GESTURES[] = { EMOTION_WINK, EMOTION_RECOVERY };
 static constexpr size_t IDLE_GREEN_COUNT = sizeof(IDLE_GREEN_GESTURES) / sizeof(IDLE_GREEN_GESTURES[0]);
 
-static const PetEmotion IDLE_WARN_GESTURES[] = {
-    EMOTION_PREDICTIVE_WARNING, EMOTION_SUSPICIOUS, EMOTION_SNEEZE, EMOTION_CRYING
-};
+static const PetEmotion IDLE_WARN_GESTURES[] = { EMOTION_PREDICTIVE_WARNING, EMOTION_SUSPICIOUS, EMOTION_SNEEZE };
 static constexpr size_t IDLE_WARN_COUNT = sizeof(IDLE_WARN_GESTURES) / sizeof(IDLE_WARN_GESTURES[0]);
 
-static const PetEmotion IDLE_CRIT_GESTURES[] = {
-    EMOTION_CRITICAL, EMOTION_HOT_PANTING, EMOTION_SNEEZE
-};
+static const PetEmotion IDLE_CRIT_GESTURES[] = { EMOTION_CRITICAL, EMOTION_HOT_PANTING, EMOTION_SNEEZE };
 static constexpr size_t IDLE_CRIT_COUNT = sizeof(IDLE_CRIT_GESTURES) / sizeof(IDLE_CRIT_GESTURES[0]);
 
 inline const char* emotionToString(PetEmotion emotion) {
@@ -52,25 +45,16 @@ inline const char* emotionToString(PetEmotion emotion) {
 inline bool parseEmotionName(const char* str, PetEmotion& out) {
     if (!str) return false;
     if (strcmp(str, "PREDICTIVE_WARNING") == 0 || strcmp(str, "WARNING_PREDICTIVE") == 0) {
-        out = EMOTION_PREDICTIVE_WARNING;
-        return true;
+        out = EMOTION_PREDICTIVE_WARNING; return true;
     }
-    if (strcmp(str, "SLEEPING") == 0) {
-        out = EMOTION_BABY_SLEEP;
-        return true;
-    }
+    if (strcmp(str, "SLEEPING") == 0) { out = EMOTION_BABY_SLEEP; return true; }
     for (size_t i = 0; i < sizeof(EMOTION_MAP) / sizeof(EMOTION_MAP[0]); i++) {
-        if (strcmp(str, EMOTION_MAP[i].name) == 0) {
-            out = EMOTION_MAP[i].emotion;
-            return true;
-        }
+        if (strcmp(str, EMOTION_MAP[i].name) == 0) { out = EMOTION_MAP[i].emotion; return true; }
     }
     return false;
 }
 
-inline bool stringToEmotion(const char* str, PetEmotion& out) {
-    return parseEmotionName(str, out);
-}
+inline bool stringToEmotion(const char* str, PetEmotion& out) { return parseEmotionName(str, out); }
 
 struct EmotionArbiterState {
     volatile uint32_t manualEmotionUntilMs = 0;
@@ -81,6 +65,7 @@ struct EmotionArbiterState {
     volatile uint32_t startledUntilMs = 0;
     volatile uint32_t babySleepUntilMs = 0;
     volatile uint32_t babyRockUntilMs = 0;
+    volatile uint32_t lastInteractionMs = 0;
 };
 
 inline void applyExternalEmotion(
@@ -94,11 +79,18 @@ inline void applyExternalEmotion(
         uint32_t now = millis();
         portENTER_CRITICAL(&stateMutex);
         sharedState.viewMode = VIEW_PET_FACE;
+        arb.lastInteractionMs = now;
         if (parsed == EMOTION_OPTIMAL) {
             arb.manualEmotionUntilMs = 0; arb.vomitSeqStartMs = 0;
             arb.nauseaUntilMs = 0; arb.dizzyUntilMs = 0; arb.startledUntilMs = 0;
             arb.babySleepUntilMs = 0; arb.babyRockUntilMs = 0;
             sharedState.emotion = EMOTION_OPTIMAL;
+        } else if (parsed == EMOTION_VOMIT) {
+            arb.manualEmotionUntilMs = 0;
+            arb.vomitSeqStartMs = now;
+            arb.nauseaUntilMs = 0; arb.dizzyUntilMs = 0; arb.startledUntilMs = 0;
+            arb.babySleepUntilMs = 0; arb.babyRockUntilMs = 0;
+            sharedState.emotion = EMOTION_NAUSEA;
         } else {
             arb.manualEmotion = parsed;
             arb.manualEmotionUntilMs = now + 8000;
@@ -155,10 +147,12 @@ inline PetEmotion resolveActiveEmotion(
         uint32_t elapsed = now - arb.vomitSeqStartMs;
         outActiveShake = true;
         sharedState.viewMode = VIEW_PET_FACE;
-        if (elapsed < 3500) return EMOTION_VOMIT;
-        if (elapsed < 6500) return EMOTION_WIPER;
+        if (elapsed < 1200) return EMOTION_NAUSEA;
+        if (elapsed < 4000) return EMOTION_VOMIT;
+        if (elapsed < 6800) return EMOTION_WIPER;
         if (elapsed < 8500) { sensors.resetShakeEnergy(); return EMOTION_RECOVERY; }
         sensors.resetShakeEnergy();
+        arb.lastInteractionMs = now;
         arb.vomitSeqStartMs = 0; outActiveShake = false; return EMOTION_OPTIMAL;
     }
     if (arb.nauseaUntilMs > now) { outActiveShake = true; sharedState.viewMode = VIEW_PET_FACE; return EMOTION_NAUSEA; }
@@ -177,8 +171,10 @@ inline PetEmotion resolveActiveEmotion(
         }
     }
 
-    if (now > 55000 && (now - sensors.getLastMotionMs() > 55000)) {
-        return EMOTION_BABY_SLEEP;
+    uint32_t lastActiveMs = max(sensors.getLastMotionMs(), (uint32_t)arb.lastInteractionMs);
+    uint32_t idleMs = (now > lastActiveMs) ? (now - lastActiveMs) : 0;
+    if (now > 50000 && idleMs >= 50000) {
+        return (idleMs < 53500) ? EMOTION_YAWN : EMOTION_BABY_SLEEP;
     }
-    return ((now % 16000) >= 13200) ? IDLE_GREEN_GESTURES[(now / 16000) % IDLE_GREEN_COUNT] : EMOTION_OPTIMAL;
+    return ((now % 22000) >= 19600) ? IDLE_GREEN_GESTURES[(now / 22000) % IDLE_GREEN_COUNT] : EMOTION_OPTIMAL;
 }

@@ -30,15 +30,11 @@ inline void renderMouthAndProps(
     } else if (emo == EMOTION_BUBBLEGUM) {
         drawBubblegumOverlay(gfx, centerX, mouthY, now);
     } else if (emo == EMOTION_DERP) {
-        gfx->drawArc(centerX, mouthY - 4, 10, 13, 20, 160, mainColor);
-        gfx->fillRoundRect(centerX - 7, mouthY + 2, 14, 16, 6, gfx->color565(244, 114, 182));
-        gfx->drawLine(centerX, mouthY + 2, centerX, mouthY + 13, gfx->color565(190, 24, 93));
+        gfx->drawArc(centerX + 3, mouthY - 3, 10, 14, 25, 165, mainColor);
     } else if (emo == EMOTION_HOT_PANTING) {
-        int pantY = (int)(sinf(now * 0.025f) * 3.5f);
-        gfx->fillEllipse(centerX, mouthY + 2, 14, 10, 0x0000);
-        gfx->drawEllipse(centerX, mouthY + 2, 14, 10, mainColor);
-        gfx->fillRoundRect(centerX - 8, mouthY + 2 + pantY, 16, 18, 7, gfx->color565(244, 114, 182));
-        gfx->drawLine(centerX, mouthY + 3 + pantY, centerX, mouthY + 15 + pantY, gfx->color565(190, 24, 93));
+        int ry = 7 + (int)(sinf(now * 0.018f) * 3.0f);
+        gfx->fillEllipse(centerX, mouthY + 4, 13, max(4, ry), gfx->color565(20, 15, 35));
+        gfx->drawEllipse(centerX, mouthY + 4, 13, max(4, ry), mainColor);
         int swY = ((now / 35) % 24);
         gfx->fillCircle(centerX + 66, centerY - 24 + swY, 5, gfx->color565(56, 189, 248));
     } else if (emo == EMOTION_COFFEE) {
@@ -79,9 +75,9 @@ inline void renderMouthAndProps(
             }
         }
     } else if (emo == EMOTION_YAWN || emo == EMOTION_FREEFALL) {
-        int ry = (emo == EMOTION_FREEFALL) ? 20 : (12 + (int)(sinf(now * 0.004f) * 6.0f));
-        gfx->fillEllipse(centerX, mouthY + 4, 15, max(6, ry), gfx->color565(20, 15, 35));
-        gfx->drawEllipse(centerX, mouthY + 4, 15, max(6, ry), mainColor);
+        int ry = (emo == EMOTION_FREEFALL) ? 20 : (6 + (int)((sinf(now * 0.0035f) + 1.0f) * 6.5f));
+        gfx->fillEllipse(centerX, mouthY + 4, 15, max(5, ry), gfx->color565(20, 15, 35));
+        gfx->drawEllipse(centerX, mouthY + 4, 15, max(5, ry), mainColor);
     } else if (emo == EMOTION_DIZZY) {
         drawDizzyStarsAndMouth(gfx, centerX, centerY, mouthY, mainColor, now);
     } else if (emo == EMOTION_LOVE) {
