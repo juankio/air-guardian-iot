@@ -20,8 +20,8 @@ private:
 
     float currentPpm = 400.0f;
     float currentCoPpm = 0.0f;
-    float currentTemp = 24.0f;
-    float currentHumidity = 50.0f;
+    float currentTemp = 25.4f;
+    float currentHumidity = 54.0f;
     float currentVoltage135 = 0.1f;
     float currentVoltage7 = 0.1f;
 
@@ -81,10 +81,18 @@ public:
         uint32_t nowDhtMs = millis();
         if (nowDhtMs - lastDhtMs >= 2500) {
             lastDhtMs = nowDhtMs;
-            float t = dht.readTemperature();
-            float h = dht.readHumidity();
-            if (!isnan(t) && t > -20.0f && t < 80.0f) currentTemp = t;
-            if (!isnan(h) && h >= 0.0f && h <= 100.0f) currentHumidity = h;
+            float rawT = dht.readTemperature();
+            float rawH = dht.readHumidity();
+            float compT = currentTemp;
+            if (!isnan(rawT) && rawT > -20.0f && rawT < 80.0f) {
+                compT = (rawT > 28.0f) ? (24.8f + (rawT - 28.0f) * 0.18f) : rawT;
+                currentTemp = compT;
+            }
+            if (!isnan(rawH) && rawH >= 0.0f && rawH <= 100.0f) {
+                float refRawT = (!isnan(rawT)) ? rawT : compT;
+                float compH = constrain(rawH + fmaxf(0.0f, refRawT - compT) * 0.85f, 20.0f, 95.0f);
+                currentHumidity = compH;
+            }
         }
 
         float envFactor = 1.0f + ((currentTemp - 20.0f) * 0.01f) + ((currentHumidity - 55.0f) * 0.005f);
@@ -136,6 +144,7 @@ public:
     bool isShaking() const { return mpuEngine.isShaking(); }
     bool isMpuConnected() const { return mpuEngine.isMpuConnected(); }
     float getShakeEnergy() const { return mpuEngine.getShakeEnergy(); }
+    float getShakeDurationMs() const { return mpuEngine.getShakeDurationMs(); }
     void resetShakeEnergy() { mpuEngine.resetShakeEnergy(); }
     float getBabyRockScore() const { return mpuEngine.getBabyRockScore(); }
     void resetBabyRockScore() { mpuEngine.resetBabyRockScore(); }
@@ -143,6 +152,7 @@ public:
     float getJerk() const { return mpuEngine.getJerk(); }
     bool isFreefalling() const { return mpuEngine.isFreefalling(); }
     uint32_t getLastRockMs() const { return mpuEngine.getLastRockMs(); }
+    uint32_t getLastMotionMs() const { return mpuEngine.getLastMotionMs(); }
     void getRawMPU(int16_t& _ax, int16_t& _ay, int16_t& _az, int16_t& _gx, int16_t& _gy, int16_t& _gz) const {
         mpuEngine.getRawMPU(_ax, _ay, _az, _gx, _gy, _gz);
     }

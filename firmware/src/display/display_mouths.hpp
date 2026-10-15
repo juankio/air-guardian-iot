@@ -55,8 +55,14 @@ inline void renderMouthAndProps(
         gfx->fillArc(centerX, mouthY - 4, 0, 22, 0, 180, gfx->color565(80, 10, 25));
         gfx->fillRect(centerX - 18, mouthY - 4, 36, 6, 0xFFFF);
         gfx->fillArc(centerX, mouthY + 6, 0, 10, 0, 180, gfx->color565(244, 114, 182));
-    } else if (emo == EMOTION_GAS_MASK || emo == EMOTION_PREDICTIVE_WARNING) {
+    } else if (emo == EMOTION_GAS_MASK) {
         drawGasMaskProp(gfx, centerX, mouthY, mainColor);
+    } else if (emo == EMOTION_PREDICTIVE_WARNING) {
+        if ((now % 3600) > 3200) {
+            gfx->fillEllipse(centerX, mouthY + 4, 11, 8, mainColor);
+        } else {
+            gfx->drawArc(centerX, mouthY + 10, 10, 14, 200, 340, mainColor);
+        }
     } else if (emo == EMOTION_WHISTLE) {
         gfx->fillCircle(centerX + 12, mouthY + 2, 5, mainColor);
         gfx->fillCircle(centerX + 12, mouthY + 2, 2, 0x0000);
@@ -93,16 +99,10 @@ inline void renderMouthAndProps(
     }
 }
 
-inline void renderCheekBlush(LovyanGFX* gfx, PetEmotion emo, int centerX, int centerY) {
+inline void renderCheekBlush(LovyanGFX* gfx, PetEmotion emo, int centerX, int centerY, uint16_t mainColor) {
     if (emo != EMOTION_NAUSEA && emo != EMOTION_VOMIT && emo != EMOTION_GAS_MASK &&
         emo != EMOTION_CRITICAL && emo != EMOTION_BABY_SLEEP && emo != EMOTION_SLEEPING) {
-        uint16_t blush = gfx->color565(16, 120, 80);
-        if (emo == EMOTION_LOVE || emo == EMOTION_BABY_ROCKING || emo == EMOTION_WINK || emo == EMOTION_LAUGHING) {
-            blush = gfx->color565(236, 72, 153);
-        } else if (emo == EMOTION_DIZZY) {
-            blush = gfx->color565(195, 215, 35);
-        }
-        gfx->fillEllipse(centerX - 60, centerY + 12, 10, 6, blush);
-        gfx->fillEllipse(centerX + 60, centerY + 12, 10, 6, blush);
+        gfx->fillEllipse(centerX - 60, centerY + 12, 9, 5, mainColor);
+        gfx->fillEllipse(centerX + 60, centerY + 12, 9, 5, mainColor);
     }
 }

@@ -20,19 +20,28 @@ static const EmotionNameEntry EMOTION_MAP[] = {
     {"COFFEE", EMOTION_COFFEE}, {"RAMEN", EMOTION_RAMEN}, {"MUSIC_VIBE", EMOTION_MUSIC_VIBE},
     {"BUTTERFLY", EMOTION_BUTTERFLY}, {"DETECTIVE", EMOTION_DETECTIVE}, {"ZEN", EMOTION_ZEN},
     {"CRYING", EMOTION_CRYING}, {"LAUGHING", EMOTION_LAUGHING}, {"HOT_PANTING", EMOTION_HOT_PANTING},
-    {"GAS_MASK", EMOTION_GAS_MASK}, {"CRITICAL", EMOTION_CRITICAL}, {"RECOVERY", EMOTION_RECOVERY}
+    {"GAS_MASK", EMOTION_GAS_MASK}, {"PREDICTIVE_WARNING", EMOTION_PREDICTIVE_WARNING},
+    {"WARNING_PREDICTIVE", EMOTION_PREDICTIVE_WARNING}, {"CRITICAL", EMOTION_CRITICAL}, {"RECOVERY", EMOTION_RECOVERY}
 };
 
-static const PetEmotion IDLE_CAROUSEL[] = {
-    EMOTION_WINK, EMOTION_BUBBLEGUM, EMOTION_WHISTLE, EMOTION_LOVE,
-    EMOTION_GLASSES_COOL, EMOTION_COFFEE, EMOTION_RAMEN, EMOTION_MUSIC_VIBE,
-    EMOTION_BUTTERFLY, EMOTION_DETECTIVE, EMOTION_DERP, EMOTION_SUSPICIOUS,
-    EMOTION_YAWN, EMOTION_SNEEZE, EMOTION_ZEN, EMOTION_LAUGHING, EMOTION_CRYING
+static const PetEmotion IDLE_GREEN_GESTURES[] = {
+    EMOTION_WINK, EMOTION_RECOVERY, EMOTION_SUSPICIOUS,
+    EMOTION_WHISTLE, EMOTION_YAWN, EMOTION_LAUGHING
 };
-static constexpr size_t IDLE_CAROUSEL_COUNT = sizeof(IDLE_CAROUSEL) / sizeof(IDLE_CAROUSEL[0]);
+static constexpr size_t IDLE_GREEN_COUNT = sizeof(IDLE_GREEN_GESTURES) / sizeof(IDLE_GREEN_GESTURES[0]);
+
+static const PetEmotion IDLE_WARN_GESTURES[] = {
+    EMOTION_PREDICTIVE_WARNING, EMOTION_SUSPICIOUS, EMOTION_SNEEZE, EMOTION_CRYING
+};
+static constexpr size_t IDLE_WARN_COUNT = sizeof(IDLE_WARN_GESTURES) / sizeof(IDLE_WARN_GESTURES[0]);
+
+static const PetEmotion IDLE_CRIT_GESTURES[] = {
+    EMOTION_CRITICAL, EMOTION_HOT_PANTING, EMOTION_SNEEZE
+};
+static constexpr size_t IDLE_CRIT_COUNT = sizeof(IDLE_CRIT_GESTURES) / sizeof(IDLE_CRIT_GESTURES[0]);
 
 inline const char* emotionToString(PetEmotion emotion) {
-    if (emotion == EMOTION_PREDICTIVE_WARNING) return "GAS_MASK";
+    if (emotion == EMOTION_PREDICTIVE_WARNING) return "WARNING_PREDICTIVE";
     if (emotion == EMOTION_SLEEPING) return "BABY_SLEEP";
     for (size_t i = 0; i < sizeof(EMOTION_MAP) / sizeof(EMOTION_MAP[0]); i++) {
         if (EMOTION_MAP[i].emotion == emotion) return EMOTION_MAP[i].name;
@@ -43,7 +52,7 @@ inline const char* emotionToString(PetEmotion emotion) {
 inline bool parseEmotionName(const char* str, PetEmotion& out) {
     if (!str) return false;
     if (strcmp(str, "PREDICTIVE_WARNING") == 0 || strcmp(str, "WARNING_PREDICTIVE") == 0) {
-        out = EMOTION_GAS_MASK;
+        out = EMOTION_PREDICTIVE_WARNING;
         return true;
     }
     if (strcmp(str, "SLEEPING") == 0) {
@@ -107,33 +116,33 @@ inline PetEmotion resolveActiveEmotion(
     bool rawShake,
     bool& outActiveShake
 ) {
-    float shakeEnergy = sensors.getShakeEnergy();
+    float shakeDurationMs = sensors.getShakeDurationMs();
     float babyRockScore = sensors.getBabyRockScore();
     float dynAccel = sensors.getDynamicAccel();
     float jerk = sensors.getJerk();
-    float roll = sensors.getRoll();
     bool freefall = sensors.isFreefalling();
 
     if (arb.vomitSeqStartMs == 0) {
-        if (shakeEnergy >= 62.0f) {
+        if (shakeDurationMs >= 3300.0f) {
             arb.vomitSeqStartMs = now;
             arb.nauseaUntilMs = 0; arb.dizzyUntilMs = 0;
             arb.babySleepUntilMs = 0; arb.babyRockUntilMs = 0;
+            sensors.resetShakeEnergy();
             sensors.resetBabyRockScore();
-        } else if (shakeEnergy >= 35.0f) {
-            if (now + 4000 > arb.nauseaUntilMs) arb.nauseaUntilMs = now + 4000;
+        } else if (shakeDurationMs >= 2200.0f) {
+            if (now + 3500 > arb.nauseaUntilMs) arb.nauseaUntilMs = now + 3500;
             arb.babySleepUntilMs = 0; arb.babyRockUntilMs = 0;
-        } else if (shakeEnergy >= 12.0f) {
-            if (now + 4000 > arb.dizzyUntilMs) arb.dizzyUntilMs = now + 4000;
+        } else if (shakeDurationMs >= 800.0f) {
+            if (now + 3500 > arb.dizzyUntilMs) arb.dizzyUntilMs = now + 3500;
             arb.babySleepUntilMs = 0; arb.babyRockUntilMs = 0;
         }
     }
 
     if (arb.babySleepUntilMs > now) {
-        if (dynAccel > 0.35f || jerk > 0.45f || shakeEnergy >= 12.0f) {
+        if (dynAccel > 0.35f || jerk > 0.45f || shakeDurationMs >= 400.0f) {
             arb.babySleepUntilMs = 0; arb.babyRockUntilMs = 0;
             sensors.resetBabyRockScore();
-            arb.startledUntilMs = now + 2500;
+            arb.startledUntilMs = now + 2200;
         }
     } else if (arb.vomitSeqStartMs == 0 && arb.nauseaUntilMs <= now && arb.dizzyUntilMs <= now && arb.startledUntilMs <= now) {
         if (babyRockScore >= 55.0f) arb.babySleepUntilMs = now + 20000;
@@ -146,9 +155,10 @@ inline PetEmotion resolveActiveEmotion(
         uint32_t elapsed = now - arb.vomitSeqStartMs;
         outActiveShake = true;
         sharedState.viewMode = VIEW_PET_FACE;
-        if (elapsed < 4000) return EMOTION_VOMIT;
-        if (elapsed < 7500) return EMOTION_WIPER;
-        if (elapsed < 9500) { sensors.resetShakeEnergy(); return EMOTION_RECOVERY; }
+        if (elapsed < 3500) return EMOTION_VOMIT;
+        if (elapsed < 6500) return EMOTION_WIPER;
+        if (elapsed < 8500) { sensors.resetShakeEnergy(); return EMOTION_RECOVERY; }
+        sensors.resetShakeEnergy();
         arb.vomitSeqStartMs = 0; outActiveShake = false; return EMOTION_OPTIMAL;
     }
     if (arb.nauseaUntilMs > now) { outActiveShake = true; sharedState.viewMode = VIEW_PET_FACE; return EMOTION_NAUSEA; }
@@ -157,12 +167,18 @@ inline PetEmotion resolveActiveEmotion(
     if (arb.babySleepUntilMs > now) { sharedState.viewMode = VIEW_PET_FACE; return EMOTION_BABY_SLEEP; }
     if (arb.babyRockUntilMs > now) { sharedState.viewMode = VIEW_PET_FACE; return EMOTION_BABY_ROCKING; }
     if (freefall) return EMOTION_FREEFALL;
-    if (fabsf(roll) > 135.0f) return EMOTION_UPSIDE_DOWN;
-    if (roll < -48.0f) return EMOTION_WALL_LEFT;
-    if (roll > 48.0f) return EMOTION_WALL_RIGHT;
-    if (!sensors.isWarmingUp() && (sharedState.co_ppm >= 30.0f || sharedState.ppm >= 1500.0f)) return EMOTION_CRITICAL;
-    if (!sensors.isWarmingUp() && (sensors.getDeltaPPM() > 45.0f || sharedState.ppm > 1100.0f)) return EMOTION_GAS_MASK;
-    if (!sensors.isWarmingUp() && sharedState.temperature >= 41.5f && ((now / 3500) % 12 == 0)) return EMOTION_HOT_PANTING;
 
-    return ((now % 8000) >= 4500) ? IDLE_CAROUSEL[(now / 8000) % IDLE_CAROUSEL_COUNT] : EMOTION_OPTIMAL;
+    if (!sensors.isWarmingUp()) {
+        if (sharedState.ppm >= 1000.0f || sharedState.co_ppm >= 35.0f) {
+            return ((now % 9000) >= 6200) ? IDLE_CRIT_GESTURES[(now / 9000) % IDLE_CRIT_COUNT] : EMOTION_CRITICAL;
+        }
+        if (sharedState.ppm >= 700.0f || sharedState.co_ppm >= 9.0f || sensors.getDeltaPPM() > 35.0f) {
+            return ((now % 11000) >= 7800) ? IDLE_WARN_GESTURES[(now / 11000) % IDLE_WARN_COUNT] : EMOTION_PREDICTIVE_WARNING;
+        }
+    }
+
+    if (now > 55000 && (now - sensors.getLastMotionMs() > 55000)) {
+        return EMOTION_BABY_SLEEP;
+    }
+    return ((now % 16000) >= 13200) ? IDLE_GREEN_GESTURES[(now / 16000) % IDLE_GREEN_COUNT] : EMOTION_OPTIMAL;
 }

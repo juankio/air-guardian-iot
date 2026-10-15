@@ -69,98 +69,32 @@ struct EmotionPalette {
     uint16_t pupilColor;
 };
 
-inline EmotionPalette getEmotionPalette(LovyanGFX* gfx, PetEmotion emo) {
-    EmotionPalette p;
-    p.bgColor = gfx->color565(4, 30, 20);
-    p.mainColor = gfx->color565(16, 215, 140);
-    p.pupilColor = gfx->color565(2, 40, 28);
+inline EmotionPalette getEmotionPalette(LovyanGFX* gfx, const DisplaySharedState& state) {
+    uint8_t br = 4, bg = 30, bb = 20;
+    uint8_t mr = 16, mg = 215, mb = 140;
+    uint8_t pr = 2, pg = 40, pb = 28;
 
-    switch (emo) {
-        case EMOTION_DIZZY:
-            p.bgColor = gfx->color565(28, 36, 8);
-            p.mainColor = gfx->color565(250, 204, 21);
-            p.pupilColor = gfx->color565(45, 55, 10);
-            break;
-        case EMOTION_NAUSEA:
-        case EMOTION_VOMIT:
-            p.bgColor = (emo == EMOTION_NAUSEA) ? gfx->color565(12, 46, 12) : gfx->color565(18, 42, 6);
-            p.mainColor = gfx->color565(163, 230, 53);
-            p.pupilColor = gfx->color565(20, 50, 8);
-            break;
-        case EMOTION_WIPER:
-        case EMOTION_RECOVERY:
-            p.bgColor = gfx->color565(6, 28, 42);
-            p.mainColor = gfx->color565(56, 189, 248);
-            p.pupilColor = gfx->color565(8, 45, 70);
-            break;
-        case EMOTION_BABY_ROCKING:
-            p.bgColor = gfx->color565(22, 16, 40);
-            p.mainColor = gfx->color565(125, 211, 252);
-            p.pupilColor = gfx->color565(12, 35, 64);
-            break;
-        case EMOTION_BABY_SLEEP:
-        case EMOTION_SLEEPING:
-        case EMOTION_YAWN:
-            p.bgColor = gfx->color565(8, 12, 26);
-            p.mainColor = gfx->color565(148, 163, 184);
-            p.pupilColor = gfx->color565(15, 23, 42);
-            break;
-        case EMOTION_STARTLED:
-        case EMOTION_FREEFALL:
-            p.bgColor = gfx->color565(38, 10, 28);
-            break;
-        case EMOTION_UPSIDE_DOWN:
-        case EMOTION_HOT_PANTING:
-            p.bgColor = gfx->color565(44, 12, 10);
-            p.mainColor = gfx->color565(251, 146, 60);
-            p.pupilColor = gfx->color565(65, 15, 10);
-            break;
-        case EMOTION_LOVE:
-            p.bgColor = gfx->color565(42, 8, 28);
-            p.mainColor = gfx->color565(244, 114, 182);
-            p.pupilColor = gfx->color565(80, 10, 40);
-            break;
-        case EMOTION_GAS_MASK:
-        case EMOTION_PREDICTIVE_WARNING:
-        case EMOTION_SUSPICIOUS:
-        case EMOTION_DETECTIVE:
-            p.bgColor = gfx->color565(36, 24, 6);
-            p.mainColor = gfx->color565(251, 191, 36);
-            p.pupilColor = gfx->color565(65, 25, 2);
-            break;
-        case EMOTION_CRITICAL:
-            p.bgColor = gfx->color565(52, 6, 14);
-            p.mainColor = gfx->color565(244, 63, 94);
-            p.pupilColor = gfx->color565(75, 4, 22);
-            break;
-        case EMOTION_MUSIC_VIBE:
-        case EMOTION_GLASSES_COOL:
-        case EMOTION_BUTTERFLY:
-            p.bgColor = gfx->color565(10, 20, 38);
-            break;
-        case EMOTION_ZEN:
-            p.bgColor = gfx->color565(10, 20, 38);
-            p.mainColor = gfx->color565(250, 204, 21);
-            p.pupilColor = gfx->color565(50, 30, 5);
-            break;
-        case EMOTION_CRYING:
-        case EMOTION_SNEEZE:
-            p.bgColor = gfx->color565(8, 24, 38);
-            p.mainColor = gfx->color565(56, 189, 248);
-            p.pupilColor = gfx->color565(8, 45, 70);
-            break;
-        case EMOTION_COFFEE:
-        case EMOTION_RAMEN:
-            p.bgColor = gfx->color565(30, 18, 8);
-            break;
-        case EMOTION_LAUGHING:
-            p.bgColor = gfx->color565(30, 18, 8);
-            p.mainColor = gfx->color565(250, 204, 21);
-            p.pupilColor = gfx->color565(50, 30, 5);
-            break;
-        default:
-            break;
+    if (state.ppm >= 1000.0f || state.co_ppm >= 35.0f || state.emotion == EMOTION_CRITICAL) {
+        br = 48; bg = 6;  bb = 14;
+        mr = 244; mg = 63; mb = 94;
+        pr = 75; pg = 4;  pb = 22;
+    } else if (state.ppm >= 700.0f || state.co_ppm >= 9.0f ||
+               state.emotion == EMOTION_PREDICTIVE_WARNING || state.emotion == EMOTION_GAS_MASK) {
+        br = 38; bg = 24; bb = 4;
+        mr = 251; mg = 191; mb = 36;
+        pr = 65; pg = 25; pb = 2;
     }
+
+    if (state.emotion == EMOTION_BABY_SLEEP || state.emotion == EMOTION_SLEEPING) {
+        br = (uint8_t)(br * 0.65f); bg = (uint8_t)(bg * 0.65f); bb = (uint8_t)(bb * 0.65f);
+        mr = (uint8_t)(mr * 0.65f); mg = (uint8_t)(mg * 0.65f); mb = (uint8_t)(mb * 0.65f);
+        pr = (uint8_t)(pr * 0.65f); pg = (uint8_t)(pg * 0.65f); pb = (uint8_t)(pb * 0.65f);
+    }
+
+    EmotionPalette p;
+    p.bgColor = gfx->color565(br, bg, bb);
+    p.mainColor = gfx->color565(mr, mg, mb);
+    p.pupilColor = gfx->color565(pr, pg, pb);
     return p;
 }
 

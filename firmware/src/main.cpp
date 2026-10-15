@@ -47,7 +47,7 @@ void setup() {
     WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
     Serial.begin(115200);
     Serial.println("\n[AIR GUARDIAN] Iniciando Sistema Dual-Core (Emo-Mecha v3.0)...");
-    sharedState = { EMOTION_OPTIMAL, VIEW_PET_FACE, 410.0f, 0.0f, 24.0f, 55.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, false };
+    sharedState = { EMOTION_OPTIMAL, VIEW_PET_FACE, 410.0f, 0.0f, 25.4f, 54.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, false };
     Serial.printf("[SYSTEM] Heap libre inicial: %u bytes\n", ESP.getFreeHeap());
     renderer.init();
     sensors.init();

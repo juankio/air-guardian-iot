@@ -75,7 +75,7 @@ public:
 
         updatePhysics(state, dt, now);
 
-        EmotionPalette palette = getEmotionPalette(gfx, state.emotion);
+        EmotionPalette palette = getEmotionPalette(gfx, state);
         gfx->startWrite();
         gfx->fillCircle(120, 120, 120, palette.bgColor);
         gfx->drawCircle(120, 120, 118, gfx->color565(55, 70, 88));
@@ -170,6 +170,6 @@ private:
         renderEyesAndBrows(gfx, emo, eyeXs, centerY, breathAngle, blinkH, currentEyeX, currentEyeY, palette.mainColor, palette.pupilColor, now);
         drawGlassesBridgeAndLoupe(gfx, emo, centerX, centerY);
         renderMouthAndProps(gfx, emo, eyeXs, centerX, centerY, breathAngle, palette.mainColor, palette.pupilColor, now);
-        renderCheekBlush(gfx, emo, centerX, centerY);
+        renderCheekBlush(gfx, emo, centerX, centerY, palette.mainColor);
     }
 };
